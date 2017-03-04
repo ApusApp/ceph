@@ -3,6 +3,7 @@ set(rados_srcs
   RadosDump.cc
   rados/RadosImport.cc
   rados/PoolDump.cc
+  ${PROJECT_SOURCE_DIR}/src/common/util.cc
   ${PROJECT_SOURCE_DIR}/src/common/obj_bencher.cc)
 add_executable(rados ${rados_srcs})
 target_link_libraries(rados librados global ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} radosstriper)
@@ -96,5 +97,7 @@ endif(WITH_CEPHFS)
 if(WITH_RBD)
   add_subdirectory(rbd)
   add_subdirectory(rbd_mirror)
-  add_subdirectory(rbd_nbd)
+  if(LINUX)
+    add_subdirectory(rbd_nbd)
+  endif()
 endif(WITH_RBD)

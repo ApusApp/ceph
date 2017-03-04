@@ -1391,6 +1391,7 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
 {
   std::string subprocess_msg;
   int ret;
+  int32_t key_type = op_state.get_key_type();
 
   ret = check_op(op_state, &subprocess_msg);
   if (ret < 0) {
@@ -1398,6 +1399,10 @@ int RGWSubUserPool::add(RGWUserAdminOpState& op_state, std::string *err_msg, boo
     return ret;
   }
 
+  if (key_type == KEY_TYPE_S3 && op_state.get_access_key().empty()) {
+    op_state.set_gen_access();
+  }
+  
   if (op_state.get_secret_key().empty()) {
     op_state.set_gen_secret();
   }
@@ -1835,9 +1840,7 @@ int RGWUser::check_op(RGWUserAdminOpState& op_state, std::string *err_msg)
 {
   bool same_id;
   bool populated;
-  //bool existing_email = false; // this check causes a fault
   rgw_user& op_id = op_state.get_user_id();
-  std::string op_email = op_state.get_user_email();
 
   RGWUserInfo user_info;
 
@@ -2613,16 +2616,16 @@ public:
     mtime = m;
   }
 
-  void dump(Formatter *f) const {
+  void dump(Formatter *f) const override {
     uci.dump(f);
   }
 };
 
 class RGWUserMetadataHandler : public RGWMetadataHandler {
 public:
-  string get_type() { return "user"; }
+  string get_type() override { return "user"; }
 
-  int get(RGWRados *store, string& entry, RGWMetadataObject **obj) {
+  int get(RGWRados *store, string& entry, RGWMetadataObject **obj) override {
     RGWUserCompleteInfo uci;
     RGWObjVersionTracker objv_tracker;
     real_time mtime;
@@ -2642,7 +2645,7 @@ public:
   }
 
   int put(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker,
-          real_time mtime, JSONObj *obj, sync_type_t sync_mode) {
+          real_time mtime, JSONObj *obj, sync_type_t sync_mode) override {
     RGWUserCompleteInfo uci;
 
     try {
@@ -2684,7 +2687,7 @@ public:
     RGWListRawObjsCtx ctx;
   };
 
-  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) {
+  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) override {
     RGWUserInfo info;
 
     rgw_user uid(entry);
@@ -2696,12 +2699,12 @@ public:
     return rgw_delete_user(store, info, objv_tracker);
   }
 
-  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) {
+  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) override {
     oid = key;
     bucket = store->get_zone_params().user_uid_pool;
   }
 
-  int list_keys_init(RGWRados *store, void **phandle)
+  int list_keys_init(RGWRados *store, void **phandle) override
   {
     list_keys_info *info = new list_keys_info;
 
@@ -2712,7 +2715,7 @@ public:
     return 0;
   }
 
-  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) {
+  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
 
     string no_filter;
@@ -2746,7 +2749,7 @@ public:
     return 0;
   }
 
-  void list_keys_complete(void *handle) {
+  void list_keys_complete(void *handle) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
     delete info;
   }

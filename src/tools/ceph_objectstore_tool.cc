@@ -42,6 +42,7 @@
 #include "rebuild_mondb.h"
 #include "ceph_objectstore_tool.h"
 #include "include/compat.h"
+#include "include/util.h"
 
 namespace po = boost::program_options;
 using namespace std;
@@ -89,7 +90,6 @@ int _action_on_all_objects_in_pg(ObjectStore *store, coll_t coll, action_on_obje
 				   coll,
 				   next,
 				   ghobject_t::get_max(),
-				   true,
 				   LIST_AT_A_TIME,
 				   &list,
 				   &next);
@@ -265,7 +265,7 @@ struct lookup_ghobject : public action_on_object_t {
   lookup_ghobject(const string& name, const boost::optional<std::string>& nspace, bool need_snapset = false) : _name(name),
 		  _namespace(nspace), _need_snapset(need_snapset) { }
 
-  virtual int call(ObjectStore *store, coll_t coll, ghobject_t &ghobj, object_info_t &oi) {
+  int call(ObjectStore *store, coll_t coll, ghobject_t &ghobj, object_info_t &oi) override {
     if (_need_snapset && !ghobj.hobj.has_snapset())
       return 0;
     if ((_name.length() == 0 || ghobj.hobj.oid.name == _name) &&
@@ -298,29 +298,6 @@ bool debug = false;
 super_header sh;
 uint64_t testalign;
 
-// Convert non-printable characters to '\###'
-static void cleanbin(string &str)
-{
-  bool cleaned = false;
-  string clean;
-
-  for (string::iterator it = str.begin(); it != str.end(); ++it) {
-    if (!isprint(*it)) {
-      clean.push_back('\\');
-      clean.push_back('0' + ((*it >> 6) & 7));
-      clean.push_back('0' + ((*it >> 3) & 7));
-      clean.push_back('0' + (*it & 7));
-      cleaned = true;
-    } else {
-      clean.push_back(*it);
-    }
-  }
-
-  if (cleaned)
-    str = clean;
-  return;
-}
-
 static int get_fd_data(int fd, bufferlist &bl)
 {
   uint64_t total = 0;
@@ -339,13 +316,6 @@ static int get_fd_data(int fd, bufferlist &bl)
 
   assert(bl.length() == total);
   return 0;
-}
-
-void myexit(int ret)
-{
-  if (g_ceph_context)
-    g_ceph_context->put();
-  exit(ret);
 }
 
 int get_log(ObjectStore *fs, __u8 struct_ver,
@@ -406,7 +376,7 @@ int finish_remove_pgs(ObjectStore *store)
     if (it->is_temp(&pgid) ||
        (it->is_pg(&pgid) && PG::_has_removal_flag(store, pgid))) {
       cout << "finish_remove_pgs " << *it << " removing " << pgid << std::endl;
-      OSD::recursive_remove_collection(store, pgid, *it);
+      OSD::recursive_remove_collection(g_ceph_context, store, pgid, *it);
       continue;
     }
 
@@ -477,12 +447,14 @@ int write_info(ObjectStore::Transaction &t, epoch_t epoch, pg_info_t &info,
   coll_t coll(info.pgid);
   ghobject_t pgmeta_oid(info.pgid.make_pgmeta_oid());
   map<string,bufferlist> km;
+  pg_info_t last_written_info;
   int ret = PG::_prepare_write_info(
+    g_ceph_context,
     &km, epoch,
-    info, coll,
+    info,
+    last_written_info,
     past_intervals,
-    pgmeta_oid,
-    true, true);
+    true, true, false);
   if (ret) cerr << "Failed to write info" << std::endl;
   t.omap_setkeys(coll, pgmeta_oid, km);
   return ret;
@@ -648,7 +620,7 @@ int ObjectStoreTool::export_files(ObjectStore *store, coll_t coll)
 
   while (!next.is_max()) {
     vector<ghobject_t> objects;
-    int r = store->collection_list(coll, next, ghobject_t::get_max(), true, 300,
+    int r = store->collection_list(coll, next, ghobject_t::get_max(), 300,
       &objects, &next);
     if (r < 0)
       return r;
@@ -918,7 +890,7 @@ int ObjectStoreTool::get_object(ObjectStore *store, coll_t coll,
     OSD::make_snapmapper_oid());
   spg_t pg;
   coll.is_pg_prefix(&pg);
-  SnapMapper mapper(&driver, 0, 0, 0, pg.shard);
+  SnapMapper mapper(g_ceph_context, &driver, 0, 0, 0, pg.shard);
 
   if (ob.hoid.hobj.is_temp()) {
     cerr << "ERROR: Export contains temporary object '" << ob.hoid << "'" << std::endl;
@@ -1072,7 +1044,7 @@ int get_pg_metadata(ObjectStore *store, bufferlist &bl, metadata_section &ms,
     bufferlist findmap_bl;
     int ret = get_osdmap(store, ms.map_epoch, findmap, findmap_bl);
     if (ret == 0) {
-      ms.osdmap = findmap;
+      ms.osdmap.deepish_copy_from(findmap);
     } else {
       cerr << "WARNING: No OSDMap in old export,"
            " some objects may be ignored due to a split" << std::endl;
@@ -1473,7 +1445,7 @@ int do_remove_object(ObjectStore *store, coll_t coll,
     store,
     coll_t(),
     OSD::make_snapmapper_oid());
-  SnapMapper mapper(&driver, 0, 0, 0, pg.shard);
+  SnapMapper mapper(g_ceph_context, &driver, 0, 0, 0, pg.shard);
   struct stat st;
 
   int r = store->stat(coll, ghobj, &st);
@@ -1543,7 +1515,7 @@ int do_list_attrs(ObjectStore *store, coll_t coll, ghobject_t &ghobj)
   for (map<string,bufferptr>::iterator i = aset.begin();i != aset.end(); ++i) {
     string key(i->first);
     if (outistty)
-      cleanbin(key);
+      key = cleanbin(key);
     cout << key << std::endl;
   }
   return 0;
@@ -1564,7 +1536,7 @@ int do_list_omap(ObjectStore *store, coll_t coll, ghobject_t &ghobj)
     for (map<string,bufferlist>::iterator i = oset.begin();i != oset.end(); ++i) {
       string key(i->first);
       if (outistty)
-        cleanbin(key);
+        key = cleanbin(key);
       cout << key << std::endl;
     }
   }
@@ -1670,7 +1642,7 @@ int do_get_attr(ObjectStore *store, coll_t coll, ghobject_t &ghobj, string key)
 
   string value(bp.c_str(), bp.length());
   if (outistty) {
-    cleanbin(value);
+    value = cleanbin(value);
     value.push_back('\n');
   }
   cout << value;
@@ -1746,7 +1718,7 @@ int do_get_omap(ObjectStore *store, coll_t coll, ghobject_t &ghobj, string key)
   bufferlist bl = out.begin()->second;
   string value(bl.c_str(), bl.length());
   if (outistty) {
-    cleanbin(value);
+    value = cleanbin(value);
     value.push_back('\n');
   }
   cout << value;
@@ -1817,7 +1789,7 @@ int do_get_omaphdr(ObjectStore *store, coll_t coll, ghobject_t &ghobj)
 
   string header(hdrbl.c_str(), hdrbl.length());
   if (outistty) {
-    cleanbin(header);
+    header = cleanbin(header);
     header.push_back('\n');
   }
   cout << header;
@@ -1856,8 +1828,8 @@ struct do_fix_lost : public action_on_object_t {
 
   explicit do_fix_lost(ObjectStore::Sequencer *_osr) : osr(_osr) {}
 
-  virtual int call(ObjectStore *store, coll_t coll,
-		   ghobject_t &ghobj, object_info_t &oi) {
+  int call(ObjectStore *store, coll_t coll,
+		   ghobject_t &ghobj, object_info_t &oi) override {
     if (oi.is_lost()) {
       cout << coll << "/" << ghobj << " is lost";
       if (!dry_run)
@@ -2255,7 +2227,8 @@ int mydump_journal(Formatter *f, string journalpath, bool m_journal_dio)
   if (!journalpath.length())
     return -EINVAL;
 
-  FileJournal *journal = new FileJournal(uuid_d(), NULL, NULL, journalpath.c_str(), m_journal_dio);
+  FileJournal *journal = new FileJournal(g_ceph_context, uuid_d(), NULL, NULL,
+					 journalpath.c_str(), m_journal_dio);
   r = journal->_fdump(*f, false);
   delete journal;
   return r;
@@ -2399,12 +2372,12 @@ int main(int argc, char **argv)
 						   po::include_positional);
   } catch(po::error &e) {
     std::cerr << e.what() << std::endl;
-    myexit(1);
+    return 1;
   }
 
   if (vm.count("help")) {
     usage(desc);
-    myexit(1);
+    return 1;
   }
 
   if (!vm.count("debug")) {
@@ -2465,7 +2438,7 @@ int main(int argc, char **argv)
      !(op == "dump-journal" && type == "filestore")) {
     cerr << "Must provide --data-path" << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   if (type == "filestore" && !vm.count("journal-path")) {
     jpath = dpath + "/journal";
@@ -2473,29 +2446,29 @@ int main(int argc, char **argv)
   if (!vm.count("op") && !vm.count("object")) {
     cerr << "Must provide --op or object command..." << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   if (op != "list" &&
       vm.count("op") && vm.count("object")) {
     cerr << "Can't specify both --op and object command syntax" << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   if (op == "apply-layout-settings" && !(vm.count("pool") ^ vm.count("pgid"))) {
     cerr << "apply-layout-settings requires either --pool or --pgid"
 	 << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   if (op != "list" && vm.count("object") && !vm.count("objcmd")) {
     cerr << "Invalid syntax, missing command" << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   if (op == "fuse" && mountpoint.length() == 0) {
     cerr << "Missing fuse mountpoint" << std::endl;
     usage(desc);
-    myexit(1);
+    return 1;
   }
   outistty = isatty(STDOUT_FILENO);
 
@@ -2504,7 +2477,7 @@ int main(int argc, char **argv)
     if (!vm.count("file") || file == "-") {
       if (outistty) {
         cerr << "stdout is a tty and no --file filename specified" << std::endl;
-        myexit(1);
+        return 1;
       }
       file_fd = STDOUT_FILENO;
     } else {
@@ -2514,7 +2487,7 @@ int main(int argc, char **argv)
     if (!vm.count("file") || file == "-") {
       if (isatty(STDIN_FILENO)) {
         cerr << "stdin is a tty and no --file filename specified" << std::endl;
-        myexit(1);
+        return 1;
       }
       file_fd = STDIN_FILENO;
     } else {
@@ -2527,16 +2500,16 @@ int main(int argc, char **argv)
   if (vm.count("file") && file_fd == fd_none && !dry_run) {
     cerr << "--file option only applies to import, export, "
 	 << "get-osdmap, set-osdmap, get-inc-osdmap or set-inc-osdmap" << std::endl;
-    myexit(1);
+    return 1;
   }
 
   if (file_fd != fd_none && file_fd < 0) {
     string err = string("file: ") + file;
     perror(err.c_str());
-    myexit(1);
+    return 1;
   }
 
-  global_init(
+  auto cct = global_init(
     NULL, ceph_options, CEPH_ENTITY_TYPE_OSD,
     CODE_ENVIRONMENT_UTILITY_NODOUT, 0);
     //CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
@@ -2559,7 +2532,7 @@ int main(int argc, char **argv)
   formatter = Formatter::create(format);
   if (formatter == NULL) {
     cerr << "unrecognized format: " << format << std::endl;
-    myexit(1);
+    return 1;
   }
 
   // Special handling for filestore journal, so we can dump it without mounting
@@ -2568,10 +2541,10 @@ int main(int argc, char **argv)
     if (ret < 0) {
       cerr << "journal-path: " << jpath << ": "
 	   << cpp_strerror(ret) << std::endl;
-      myexit(1);
+      return 1;
     }
     formatter->flush(cout);
-    myexit(0);
+    return 0;
   }
 
   //Verify that data-path really exists
@@ -2579,40 +2552,40 @@ int main(int argc, char **argv)
   if (::stat(dpath.c_str(), &st) == -1) {
     string err = string("data-path: ") + dpath;
     perror(err.c_str());
-    myexit(1);
+    return 1;
   }
 
   if (pgidstr.length() && !pgid.parse(pgidstr.c_str())) {
     cerr << "Invalid pgid '" << pgidstr << "' specified" << std::endl;
-    myexit(1);
+    return 1;
   }
 
   ObjectStore *fs = ObjectStore::create(g_ceph_context, type, dpath, jpath, flags);
   if (fs == NULL) {
     cerr << "Unable to create store of type " << type << std::endl;
-    myexit(1);
+    return 1;
   }
 
-  if (op == "fsck") {
-    int r = fs->fsck();
+  if (op == "fsck" || op == "fsck-deep") {
+    int r = fs->fsck(op == "fsck-deep");
     if (r < 0) {
       cerr << "fsck failed: " << cpp_strerror(r) << std::endl;
-      myexit(1);
+      return 1;
     }
     if (r > 0) {
       cerr << "fsck found " << r << " errors" << std::endl;
-      myexit(1);
+      return 1;
     }
     cout << "fsck found no errors" << std::endl;
-    exit(0);
+    return 0;
   }
   if (op == "mkfs") {
     int r = fs->mkfs();
     if (r < 0) {
       cerr << "fsck failed: " << cpp_strerror(r) << std::endl;
-      myexit(1);
+      return 1;
     }
-    myexit(0);
+    return 0;
   }
 
   ObjectStore::Sequencer *osr = new ObjectStore::Sequencer(__func__);
@@ -2623,7 +2596,7 @@ int main(int argc, char **argv)
     } else {
       cerr << "Mount failed with '" << cpp_strerror(ret) << "'" << std::endl;
     }
-    myexit(1);
+    return 1;
   }
 
   if (op == "fuse") {
@@ -2633,12 +2606,12 @@ int main(int argc, char **argv)
     int r = fuse.main();
     if (r < 0) {
       cerr << "failed to mount fuse: " << cpp_strerror(r) << std::endl;
-      myexit(1);
+      return 1;
     }
 #else
     cerr << "fuse support not enabled" << std::endl;
 #endif
-    myexit(0);
+    return 0;
   }
 
   vector<coll_t> ls;
@@ -2692,7 +2665,8 @@ int main(int argc, char **argv)
     } else {
     json_spirit::Value v;
     try {
-      if (!json_spirit::read(object, v)) {
+      if (!json_spirit::read(object, v) ||
+          (v.type() != json_spirit::array_type && v.type() != json_spirit::obj_type)) {
         // Special: Need head/snapdir so set even if user didn't specify
         if (vm.count("objcmd") && (objcmd == "remove-clone-metadata"))
 	  head = true;
@@ -3272,9 +3246,9 @@ int main(int argc, char **argv)
       ObjectStore::Transaction tran;
       ObjectStore::Transaction *t = &tran;
 
-      if (struct_ver != PG::cur_struct_v) {
+      if (struct_ver < PG::compat_struct_v) {
         cerr << "Can't remove past-intervals, version mismatch " << (int)struct_ver
-          << " (pg)  != " << (int)PG::cur_struct_v << " (tool)"
+          << " (pg)  < compat " << (int)PG::compat_struct_v << " (tool)"
           << std::endl;
         ret = -EFAULT;
         goto out;
@@ -3297,9 +3271,9 @@ int main(int argc, char **argv)
       ObjectStore::Transaction tran;
       ObjectStore::Transaction *t = &tran;
 
-      if (struct_ver != PG::cur_struct_v) {
-	cerr << "Can't mark-complete, version mismatch " << (int)struct_ver
-	     << " (pg)  != " << (int)PG::cur_struct_v << " (tool)"
+      if (struct_ver < PG::compat_struct_v) {
+        cerr << "Can't mark-complete, version mismatch " << (int)struct_ver
+	     << " (pg)  < compat " << (int)PG::compat_struct_v << " (tool)"
 	     << std::endl;
 	ret = 1;
 	goto out;
@@ -3349,5 +3323,5 @@ out:
 
   if (ret < 0)
     ret = 1;
-  myexit(ret);
+  return ret;
 }

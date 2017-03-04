@@ -26,11 +26,17 @@
 #include "global/signal_handler.h"
 #include "include/compat.h"
 #include "include/str_list.h"
+#include "common/admin_socket.h"
 
 #include <pwd.h>
 #include <grp.h>
 #include <errno.h>
 
+#ifdef HAVE_SYS_PRCTL_H
+#include <sys/prctl.h>
+#endif
+
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_
 
 static void global_init_set_globals(CephContext *cct)
@@ -125,11 +131,12 @@ void global_pre_init(std::vector < const char * > *alt_def_args,
   g_conf->complain_about_parse_errors(g_ceph_context);
 }
 
-void global_init(std::vector < const char * > *alt_def_args,
-		 std::vector < const char* >& args,
-		 uint32_t module_type, code_environment_t code_env,
-		 int flags,
-		 const char *data_dir_option, bool run_pre_init)
+boost::intrusive_ptr<CephContext>
+global_init(std::vector < const char * > *alt_def_args,
+	    std::vector < const char* >& args,
+	    uint32_t module_type, code_environment_t code_env,
+	    int flags,
+	    const char *data_dir_option, bool run_pre_init)
 {
   // Ensure we're not calling the global init functions multiple times.
   static bool first_run = true;
@@ -262,6 +269,12 @@ void global_init(std::vector < const char * > *alt_def_args,
     }
   }
 
+#if defined(HAVE_SYS_PRCTL_H)
+  if (prctl(PR_SET_DUMPABLE, 1) == -1) {
+    cerr << "warning: unable to set dumpable flag: " << cpp_strerror(errno) << std::endl;
+  }
+#endif
+
   // Expand metavariables. Invoke configuration observers. Open log file.
   g_conf->apply_changes(NULL);
 
@@ -313,7 +326,22 @@ void global_init(std::vector < const char * > *alt_def_args,
   if (code_env == CODE_ENVIRONMENT_DAEMON && !(flags & CINIT_FLAG_NO_DAEMON_ACTIONS))
     output_ceph_version();
 
-  g_ceph_context->crush_location.init_on_startup();
+  if (g_ceph_context->crush_location.init_on_startup()) {
+    cerr << " failed to init_on_startup : " << cpp_strerror(errno) << std::endl;
+    exit(1);
+  }
+
+  return boost::intrusive_ptr<CephContext>{g_ceph_context, false};
+}
+
+void intrusive_ptr_add_ref(CephContext* cct)
+{
+  cct->get();
+}
+
+void intrusive_ptr_release(CephContext* cct)
+{
+  cct->put();
 }
 
 void global_print_banner(void)
@@ -498,6 +526,6 @@ int global_init_preload_erasure_code(const CephContext *cct)
   if (r)
     derr << ss.str() << dendl;
   else
-    dout(10) << ss.str() << dendl;
+    dout(0) << ss.str() << dendl;
   return r;
 }

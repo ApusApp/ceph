@@ -1,9 +1,10 @@
-#include "common/config.h"
 #include "include/buffer.h"
 #include "include/encoding.h"
 #include "include/small_encoding.h"
 
 #include "gtest/gtest.h"
+
+using namespace std;
 
 template < typename T >
 static void test_encode_and_decode(const T& src)
@@ -34,6 +35,7 @@ TEST(EncodingRoundTrip, StringNewline) {
 typedef std::multimap < int, std::string > multimap_t;
 typedef multimap_t::value_type my_val_ty;
 
+namespace std {
 static std::ostream& operator<<(std::ostream& oss, const multimap_t &multimap)
 {
   for (multimap_t::const_iterator m = multimap.begin();
@@ -43,6 +45,7 @@ static std::ostream& operator<<(std::ostream& oss, const multimap_t &multimap)
     oss << m->first << "->" << m->second << " ";
   }
   return oss;
+}
 }
 
 TEST(EncodingRoundTrip, Multimap) {
@@ -196,6 +199,62 @@ TEST(EncodingRoundTrip, MultimapConstructorCounter) {
   EXPECT_EQ(my_val_t::get_one_arg_ctor(), 0);
   EXPECT_EQ(my_val_t::get_copy_ctor(), 5);
   EXPECT_EQ(my_val_t::get_assigns(), 0);
+}
+
+// make sure that the legacy encode/decode methods are selected
+// over the ones defined using templates. the later is likely to
+// be slower, see also the definition of "WRITE_INT_DENC" in
+// include/denc.h
+template<>
+void encode<uint64_t, denc_traits<uint64_t>>(const uint64_t&,
+                                             bufferlist&,
+                                             uint64_t f) {
+  static_assert(denc_traits<uint64_t>::supported,
+                "should support new encoder");
+  static_assert(!denc_traits<uint64_t>::featured,
+                "should not be featured");
+  ASSERT_EQ(0UL, f);
+  // make sure the test fails if i get called
+  ASSERT_TRUE(false);
+}
+
+template<>
+void encode<ceph_le64, denc_traits<ceph_le64>>(const ceph_le64&,
+                                               bufferlist&,
+                                               uint64_t f) {
+  static_assert(denc_traits<ceph_le64>::supported,
+                "should support new encoder");
+  static_assert(!denc_traits<ceph_le64>::featured,
+                "should not be featured");
+  ASSERT_EQ(0UL, f);
+  // make sure the test fails if i get called
+  ASSERT_TRUE(false);
+}
+
+TEST(EncodingRoundTrip, Integers) {
+  // int types
+  {
+    uint64_t i = 42;
+    test_encode_and_decode(i);
+  }
+  {
+    int16_t i = 42;
+    test_encode_and_decode(i);
+  }
+  {
+    bool b = true;
+    test_encode_and_decode(b);
+  }
+  {
+    bool b = false;
+    test_encode_and_decode(b);
+  }
+  // raw encoder
+  {
+    ceph_le64 i;
+    i = 42;
+    test_encode_and_decode(i);
+  }
 }
 
 const char* expected_what[] = {

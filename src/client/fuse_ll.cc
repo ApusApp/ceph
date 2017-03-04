@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,9 +7,9 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
 #include <sys/file.h>
@@ -32,10 +32,13 @@
 #include "ioctl.h"
 #include "common/config.h"
 #include "include/assert.h"
+#include "include/cephfs/ceph_statx.h"
 
 #include "fuse_ll.h"
 #include <fuse.h>
 #include <fuse_lowlevel.h>
+
+#define dout_context g_ceph_context
 
 #define FINO_INO(x) ((x) & ((1ull<<48)-1ull))
 #define FINO_STAG(x) ((x) >> 48)
@@ -515,16 +518,32 @@ static void fuse_ll_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
   UserPerm perm(ctx->uid, ctx->gid);
   GET_GROUPS(perm, req);
   
-  int r = cfuse->client->ll_link(in, nin, newname, &fe.attr, perm);
+  /*
+   * Note that we could successfully link, but then fail the subsequent
+   * getattr and return an error. Perhaps we should ignore getattr errors,
+   * but then how do we tell FUSE that the attrs are bogus?
+   */
+  int r = cfuse->client->ll_link(in, nin, newname, perm);
   if (r == 0) {
-    fe.ino = cfuse->make_fake_ino(fe.attr.st_ino, fe.attr.st_dev);
-    fe.attr.st_rdev = new_encode_dev(fe.attr.st_rdev);
-    fuse_reply_entry(req, &fe);
-  } else {
+    r = cfuse->client->ll_getattr(in, &fe.attr, perm);
+    if (r == 0) {
+      fe.ino = cfuse->make_fake_ino(fe.attr.st_ino, fe.attr.st_dev);
+      fe.attr.st_rdev = new_encode_dev(fe.attr.st_rdev);
+      fuse_reply_entry(req, &fe);
+    }
+  }
+
+  if (r != 0) {
+    /*
+     * Many ll operations in libcephfs return an extra inode reference, but
+     * ll_link currently does not. Still, FUSE needs one for the new dentry,
+     * so we commandeer the reference taken earlier when ll_link is successful.
+     * On error however, we must put that reference.
+     */
+    cfuse->iput(in);
     fuse_reply_err(req, -r);
   }
 
-  cfuse->iput(in); // iputs required
   cfuse->iput(nin);
 }
 
@@ -591,7 +610,7 @@ static void fuse_ll_flush(fuse_req_t req, fuse_ino_t ino,
 
 #ifdef FUSE_IOCTL_COMPAT
 static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, struct fuse_file_info *fi,
-                          unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz)
+			  unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz)
 {
   CephFuse::Handle *cfuse = fuse_ll_req_prepare(req);
 
@@ -600,7 +619,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, st
     return;
   }
 
-  switch(cmd) {
+  switch (static_cast<unsigned>(cmd)) {
     case CEPH_IOC_GET_LAYOUT: {
       file_layout_t layout;
       struct ceph_ioctl_layout l;
@@ -662,19 +681,21 @@ struct readdir_context {
 /*
  * return 0 on success, -1 if out of space
  */
-static int fuse_ll_add_dirent(void *p, struct dirent *de, struct stat *st,
-			      int stmask, off_t next_off)
+static int fuse_ll_add_dirent(void *p, struct dirent *de,
+			      struct ceph_statx *stx, off_t next_off,
+			      Inode *in)
 {
   struct readdir_context *c = (struct readdir_context *)p;
   CephFuse::Handle *cfuse = (CephFuse::Handle *)fuse_req_userdata(c->req);
 
-  st->st_ino = cfuse->make_fake_ino(de->d_ino, c->snap);
-  st->st_mode = DTTOIF(de->d_type);
-  st->st_rdev = new_encode_dev(st->st_rdev);
+  struct stat st;
+  st.st_ino = cfuse->make_fake_ino(stx->stx_ino, c->snap);
+  st.st_mode = stx->stx_mode;
+  st.st_rdev = new_encode_dev(stx->stx_rdev);
 
   size_t room = c->size - c->pos;
   size_t entrysize = fuse_add_direntry(c->req, c->buf + c->pos, room,
-				       de->d_name, st, next_off);
+				       de->d_name, &st, next_off);
   if (entrysize > room)
     return -ENOSPC;
 
@@ -912,7 +933,9 @@ static void do_init(void *data, fuse_conn_info *conn)
 
   if (cfuse->fd_on_success) {
     //cout << "fuse init signaling on fd " << fd_on_success << std::endl;
-    uint32_t r = 0;
+    // see Preforker::daemonize(), ceph-fuse's parent process expects a `-1`
+    // from a daemonized child process.
+    uint32_t r = -1;
     int err = safe_write(cfuse->fd_on_success, &r, sizeof(r));
     if (err) {
       derr << "fuse_ll: do_init: safe_write failed with error "

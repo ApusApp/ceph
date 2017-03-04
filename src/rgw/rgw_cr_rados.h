@@ -12,21 +12,18 @@ class RGWAsyncRadosRequest : public RefCountedObject {
 
   int retcode;
 
-  bool done;
-
   Mutex lock;
 
 protected:
   virtual int _send_request() = 0;
 public:
   RGWAsyncRadosRequest(RGWCoroutine *_caller, RGWAioCompletionNotifier *_cn) : caller(_caller), notifier(_cn), retcode(0),
-                                                                               done(false), lock("RGWAsyncRadosRequest::lock") {
-    notifier->get();
-    caller->get();
+                                                                               lock("RGWAsyncRadosRequest::lock") {
   }
   virtual ~RGWAsyncRadosRequest() {
-    notifier->put();
-    caller->put();
+    if (notifier) {
+      notifier->put();
+    }
   }
 
   void send_request() {
@@ -34,8 +31,9 @@ public:
     retcode = _send_request();
     {
       Mutex::Locker l(lock);
-      if (!done) {
-        notifier->cb();
+      if (notifier) {
+        notifier->cb(); // drops its own ref
+        notifier = nullptr;
       }
     }
     put();
@@ -46,7 +44,11 @@ public:
   void finish() {
     {
       Mutex::Locker l(lock);
-      done = true;
+      if (notifier) {
+        // we won't call notifier->cb() to drop its ref, so drop it here
+        notifier->put();
+        notifier = nullptr;
+      }
     }
     put();
   }
@@ -68,7 +70,7 @@ protected:
 
     bool _enqueue(RGWAsyncRadosRequest *req);
     void _dequeue(RGWAsyncRadosRequest *req) {
-      assert(0);
+      ceph_abort();
     }
     bool _empty();
     RGWAsyncRadosRequest *_dequeue();
@@ -199,7 +201,7 @@ public:
   ~RGWSimpleRadosReadCR() {
     request_cleanup();
   }
-                                                         
+
   void request_cleanup() {
     if (req) {
       req->finish();
@@ -241,9 +243,17 @@ int RGWSimpleRadosReadCR<T>::request_complete()
     if (ret < 0) {
       return ret;
     }
-    bufferlist::iterator iter = bl.begin();
     try {
-      ::decode(*result, iter);
+      bufferlist::iterator iter = bl.begin();
+      if (iter.end()) {
+        // allow successful reads with empty buffers. ReadSyncStatus coroutines
+        // depend on this to be able to read without locking, because the
+        // cls lock from InitSyncStatus will create an empty object if it didnt
+        // exist
+        *result = T();
+      } else {
+        ::decode(*result, iter);
+      }
     } catch (buffer::error& err) {
       return -EIO;
     }
@@ -484,6 +494,13 @@ public:
 
   int send_request();
   int request_complete();
+
+  static std::string gen_random_cookie(CephContext* cct) {
+#define COOKIE_LEN 16
+    char buf[COOKIE_LEN + 1];
+    gen_rand_alphanumeric(cct, buf, sizeof(buf) - 1);
+    return buf;
+  }
 };
 
 class RGWSimpleRadosUnlockCR : public RGWSimpleCoroutine {
@@ -557,7 +574,7 @@ class RGWAsyncWait : public RGWAsyncRadosRequest {
 protected:
   int _send_request() {
     Mutex::Locker l(*lock);
-    return cond->WaitInterval(cct, *lock, interval);
+    return cond->WaitInterval(*lock, interval);
   }
 public:
   RGWAsyncWait(RGWCoroutine *caller, RGWAioCompletionNotifier *cn, CephContext *_cct,
@@ -583,7 +600,7 @@ class RGWWaitCR : public RGWSimpleCoroutine {
 public:
   RGWWaitCR(RGWAsyncRadosProcessor *_async_rados, CephContext *_cct,
 	    Mutex *_lock, Cond *_cond,
-            int _secs) : RGWSimpleCoroutine(cct), cct(_cct),
+            int _secs) : RGWSimpleCoroutine(_cct), cct(_cct),
                          async_rados(_async_rados), lock(_lock), cond(_cond), secs(_secs), req(NULL) {
   }
   ~RGWWaitCR() {
@@ -1002,33 +1019,30 @@ class RGWContinuousLeaseCR : public RGWCoroutine {
   RGWRados *store;
 
   const rgw_bucket& pool;
-  string oid;
+  const string oid;
 
-  string lock_name;
-  string cookie;
+  const string lock_name;
+  const string cookie;
 
   int interval;
 
   Mutex lock;
   atomic_t going_down;
-  bool locked;
+  bool locked{false};
 
   RGWCoroutine *caller;
 
-  bool aborted;
+  bool aborted{false};
 
 public:
   RGWContinuousLeaseCR(RGWAsyncRadosProcessor *_async_rados, RGWRados *_store,
                        const rgw_bucket& _pool, const string& _oid,
-                       const string& _lock_name, int _interval, RGWCoroutine *_caller) : RGWCoroutine(_store->ctx()), async_rados(_async_rados), store(_store),
-                                        pool(_pool), oid(_oid), lock_name(_lock_name), interval(_interval),
-                                        lock("RGWContimuousLeaseCR"), locked(false), caller(_caller), aborted(false) {
-#define COOKIE_LEN 16
-    char buf[COOKIE_LEN + 1];
-
-    gen_rand_alphanumeric(cct, buf, sizeof(buf) - 1);
-    cookie = buf;
-  }
+                       const string& _lock_name, int _interval, RGWCoroutine *_caller)
+    : RGWCoroutine(_store->ctx()), async_rados(_async_rados), store(_store),
+    pool(_pool), oid(_oid), lock_name(_lock_name),
+    cookie(RGWSimpleRadosLockCR::gen_random_cookie(cct)),
+    interval(_interval), lock("RGWContinuousLeaseCR"), caller(_caller)
+  {}
 
   int operate();
 

@@ -306,6 +306,25 @@ int SimpleMessenger::rebind(const set<int>& avoid_ports)
   return accepter.rebind(avoid_ports);
 }
 
+
+int SimpleMessenger::client_bind(const entity_addr_t &bind_addr)
+{
+  Mutex::Locker l(lock);
+  if (did_bind) {
+    assert(my_inst.addr == bind_addr);
+    return 0;
+  }
+  if (started) {
+    ldout(cct,10) << "rank.bind already started" << dendl;
+    return -1;
+  }
+  ldout(cct,10) << "rank.bind " << bind_addr << dendl;
+
+  set_myaddr(bind_addr);
+  return 0;
+}
+
+
 int SimpleMessenger::start()
 {
   lock.Lock();
@@ -572,6 +591,10 @@ void SimpleMessenger::wait()
       p->unregister_pipe();
       p->pipe_lock.Lock();
       p->stop_and_wait();
+      // don't generate an event here; we're shutting down anyway.
+      PipeConnectionRef con = p->connection_state;
+      if (con)
+	con->clear_pipe(p);
       p->pipe_lock.Unlock();
     }
 
@@ -703,9 +726,10 @@ void SimpleMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
   if (need_addr) {
     entity_addr_t t = peer_addr_for_me;
     t.set_port(my_inst.addr.get_port());
-    ANNOTATE_BENIGN_RACE_SIZED(&my_inst.addr.u, sizeof(my_inst.addr.u),
+    t.set_nonce(my_inst.addr.get_nonce());
+    ANNOTATE_BENIGN_RACE_SIZED(&my_inst.addr, sizeof(my_inst.addr),
                                "SimpleMessenger learned addr");
-    my_inst.addr.u = t.u;
+    my_inst.addr = t;
     ldout(cct,1) << "learned my addr " << my_inst.addr << dendl;
     need_addr = false;
     init_local_connection();

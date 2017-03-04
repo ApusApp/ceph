@@ -23,6 +23,7 @@
 #include "include/xlist.h"
 #include "osdc/ObjectCacher.h"
 
+#include "cls/rbd/cls_rbd_types.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/AsyncRequest.h"
 #include "librbd/SnapInfo.h"
@@ -37,22 +38,23 @@ class SafeTimer;
 
 namespace librbd {
 
-  struct ImageCtx;
-  class AioCompletion;
-  class AioImageRequestWQ;
   class AsyncOperation;
-  class CopyupRequest;
   template <typename> class ExclusiveLock;
   template <typename> class ImageState;
   template <typename> class ImageWatcher;
   template <typename> class Journal;
   class LibrbdAdminSocketHook;
-  class ObjectMap;
+  template <typename> class ObjectMap;
   template <typename> class Operations;
   class LibrbdWriteback;
 
   namespace cache { struct ImageCache; }
   namespace exclusive_lock { struct Policy; }
+  namespace io {
+  class AioCompletion;
+  class ImageRequestWQ;
+  class CopyupRequest;
+  }
   namespace journal { struct Policy; }
 
   namespace operation {
@@ -136,7 +138,7 @@ namespace librbd {
     Readahead readahead;
     uint64_t total_bytes_read;
 
-    std::map<uint64_t, CopyupRequest*> copyup_list;
+    std::map<uint64_t, io::CopyupRequest*> copyup_list;
 
     xlist<AsyncOperation*> async_ops;
     xlist<AsyncRequest<>*> async_requests;
@@ -146,12 +148,12 @@ namespace librbd {
     Operations<ImageCtx> *operations;
 
     ExclusiveLock<ImageCtx> *exclusive_lock;
-    ObjectMap *object_map;
+    ObjectMap<ImageCtx> *object_map;
 
     xlist<operation::ResizeRequest<ImageCtx>*> resize_reqs;
 
-    AioImageRequestWQ *aio_work_queue;
-    xlist<AioCompletion*> completed_reqs;
+    io::ImageRequestWQ *io_work_queue;
+    xlist<io::AioCompletion*> completed_reqs;
     EventSocket event_socket;
 
     ContextWQ *op_work_queue;
@@ -190,6 +192,8 @@ namespace librbd {
     uint32_t journal_max_payload_bytes;
     int journal_max_concurrent_object_sets;
     bool mirroring_resync_after_disconnect;
+    int mirroring_replay_delay;
+    bool skip_partial_discard;
 
     LibrbdAdminSocketHook *asok_hook;
 
@@ -230,6 +234,8 @@ namespace librbd {
     const SnapInfo* get_snap_info(librados::snap_t in_snap_id) const;
     int get_snap_name(librados::snap_t in_snap_id,
 		      std::string *out_snap_name) const;
+    int get_snap_namespace(librados::snap_t in_snap_id,
+			   cls::rbd::SnapshotNamespace *out_snap_namespace) const;
     int get_parent_spec(librados::snap_t in_snap_id,
 			parent_spec *pspec) const;
     int is_snap_protected(librados::snap_t in_snap_id,
@@ -244,9 +250,11 @@ namespace librbd {
     uint64_t get_stripe_count() const;
     uint64_t get_stripe_period() const;
 
-    void add_snap(std::string in_snap_name, librados::snap_t id,
+    void add_snap(std::string in_snap_name,
+		  cls::rbd::SnapshotNamespace in_snap_namespace,
+		  librados::snap_t id,
 		  uint64_t in_size, parent_info parent,
-                  uint8_t protection_status, uint64_t flags);
+		  uint8_t protection_status, uint64_t flags, utime_t timestamp);
     void rm_snap(std::string in_snap_name, librados::snap_t id);
     uint64_t get_image_size(librados::snap_t in_snap_id) const;
     uint64_t get_object_count(librados::snap_t in_snap_id) const;
@@ -273,9 +281,10 @@ namespace librbd {
     void user_flushed();
     void flush_cache(Context *onfinish);
     void shut_down_cache(Context *on_finish);
-    int invalidate_cache(bool purge_on_error=false);
-    void invalidate_cache(Context *on_finish);
+    int invalidate_cache(bool purge_on_error);
+    void invalidate_cache(bool purge_on_error, Context *on_finish);
     void clear_nonexistence_cache();
+    bool is_cache_empty();
     void register_watch(Context *on_finish);
     uint64_t prune_parent_extents(vector<pair<uint64_t,uint64_t> >& objectx,
 				  uint64_t overlap);
@@ -292,7 +301,7 @@ namespace librbd {
     void apply_metadata(const std::map<std::string, bufferlist> &meta);
 
     ExclusiveLock<ImageCtx> *create_exclusive_lock();
-    ObjectMap *create_object_map(uint64_t snap_id);
+    ObjectMap<ImageCtx> *create_object_map(uint64_t snap_id);
     Journal<ImageCtx> *create_journal();
 
     void clear_pending_completions();
@@ -308,7 +317,9 @@ namespace librbd {
     journal::Policy *get_journal_policy() const;
     void set_journal_policy(journal::Policy *policy);
 
-    static ThreadPool *get_thread_pool_instance(CephContext *cct);
+    static void get_thread_pool_instance(CephContext *cct,
+                                         ThreadPool **thread_pool,
+                                         ContextWQ **op_work_queue);
     static void get_timer_instance(CephContext *cct, SafeTimer **timer,
                                    Mutex **timer_lock);
   };

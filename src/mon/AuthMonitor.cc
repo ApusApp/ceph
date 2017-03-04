@@ -188,7 +188,7 @@ void AuthMonitor::update_from_paxos(bool *need_bootstrap)
     mon->key_server.set_ver(keys_ver);
 
     if (keys_ver == 1 && mon->is_keyring_required()) {
-      MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+      auto t(std::make_shared<MonitorDBStore::Transaction>());
       t->erase("mkfs", "keyring");
       mon->store->apply_transaction(t);
     }
@@ -236,7 +236,7 @@ void AuthMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   ::encode(v, bl);
   vector<Incremental>::iterator p;
   for (p = pending_auth.begin(); p != pending_auth.end(); ++p)
-    p->encode(bl, mon->get_quorum_features());
+    p->encode(bl, mon->get_quorum_con_features());
 
   version_t version = get_last_committed() + 1;
   put_version(t, version, bl);
@@ -291,7 +291,7 @@ bool AuthMonitor::preprocess_query(MonOpRequestRef op)
     return false;
 
   default:
-    assert(0);
+    ceph_abort();
     return true;
   }
 }
@@ -308,7 +308,7 @@ bool AuthMonitor::prepare_update(MonOpRequestRef op)
   case CEPH_MSG_AUTH:
     return prep_auth(op, true);
   default:
-    assert(0);
+    ceph_abort();
     return false;
   }
 }
@@ -647,11 +647,15 @@ void AuthMonitor::export_keyring(KeyRing& keyring)
   mon->key_server.export_keyring(keyring);
 }
 
-void AuthMonitor::import_keyring(KeyRing& keyring)
+int AuthMonitor::import_keyring(KeyRing& keyring)
 {
   for (map<EntityName, EntityAuth>::iterator p = keyring.get_keys().begin();
        p != keyring.get_keys().end();
        ++p) {
+    if (p->second.caps.empty()) {
+      dout(0) << "import: no caps supplied" << dendl;
+      return -EINVAL;
+    }
     KeyServerData::Incremental auth_inc;
     auth_inc.name = p->first;
     auth_inc.auth = p->second;
@@ -660,6 +664,7 @@ void AuthMonitor::import_keyring(KeyRing& keyring)
     dout(30) << "    " << auth_inc.auth << dendl;
     push_cephx_inc(auth_inc);
   }
+  return 0;
 }
 
 bool AuthMonitor::prepare_command(MonOpRequestRef op)
@@ -726,7 +731,13 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
       err = -EINVAL;
       goto done;
     }
-    import_keyring(keyring);
+    err = import_keyring(keyring);
+    if (err < 0) {
+      ss << "auth import: no caps supplied";
+      getline(ss, rs);
+      mon->reply_command(op, -EINVAL, rs, get_last_committed());
+      return true;
+    }
     ss << "imported keyring";
     getline(ss, rs);
     err = 0;

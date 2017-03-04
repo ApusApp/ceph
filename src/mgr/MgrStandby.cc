@@ -27,6 +27,7 @@
 
 #include "MgrStandby.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr " << __func__ << " "
@@ -49,7 +50,6 @@ MgrStandby::~MgrStandby()
   delete objecter;
   delete monc;
   delete client_messenger;
-  delete active_mgr;
 }
 
 
@@ -73,8 +73,14 @@ int MgrStandby::init()
   monc->set_want_keys(CEPH_ENTITY_TYPE_MON|CEPH_ENTITY_TYPE_OSD
       |CEPH_ENTITY_TYPE_MDS|CEPH_ENTITY_TYPE_MGR);
   monc->set_messenger(client_messenger);
-  monc->init();
-  int r = monc->authenticate();
+  int r = monc->init();
+  if (r < 0) {
+    monc->shutdown();
+    client_messenger->shutdown();
+    client_messenger->wait();
+    return r;
+  }
+  r = monc->authenticate();
   if (r < 0) {
     derr << "Authentication failed, did you specify a mgr ID with a valid keyring?" << dendl;
     monc->shutdown();
@@ -112,9 +118,8 @@ void MgrStandby::send_beacon()
                                  available);
                                  
   monc->send_mon_message(m);
-  // TODO configure period
-  timer.add_event_after(5, new C_StdFunction(
-        [this](){
+  timer.add_event_after(g_conf->mgr_beacon_period, new FunctionContext(
+        [this](int r){
           send_beacon();
         }
   )); 
@@ -124,6 +129,7 @@ void MgrStandby::handle_signal(int signum)
 {
   Mutex::Locker l(lock);
   assert(signum == SIGINT || signum == SIGTERM);
+  derr << "*** Got signal " << sig_str(signum) << " ***" << dendl;
   shutdown();
 }
 
@@ -152,9 +158,9 @@ void MgrStandby::handle_mgr_map(MMgrMap* mmap)
   dout(4) << "active in map: " << active_in_map
           << " active is " << map.active_gid << dendl;
   if (active_in_map) {
-    if (active_mgr == nullptr) {
+    if (!active_mgr) {
       dout(1) << "Activating!" << dendl;
-      active_mgr = new Mgr(monc, client_messenger, objecter);
+      active_mgr.reset(new Mgr(monc, client_messenger, objecter));
       active_mgr->background_init();
       dout(1) << "I am now active" << dendl;
     } else {
@@ -164,8 +170,7 @@ void MgrStandby::handle_mgr_map(MMgrMap* mmap)
     if (active_mgr != nullptr) {
       derr << "I was active but no longer am" << dendl;
       active_mgr->shutdown();
-      delete active_mgr;
-      active_mgr = nullptr;
+      active_mgr.reset();
     }
   }
 }
@@ -204,7 +209,7 @@ bool MgrStandby::ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer,
       return false;
   }
 
-  *authorizer = monc->auth->build_authorizer(dest_type);
+  *authorizer = monc->build_authorizer(dest_type);
   return *authorizer != NULL;
 }
 

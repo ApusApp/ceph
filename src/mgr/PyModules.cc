@@ -27,6 +27,7 @@
 
 #include "PyModules.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr " << __func__ << " "
@@ -125,7 +126,7 @@ PyObject *PyModules::get_python(const std::string &what)
   } else if (what == "osdmap_crush_map_text") {
     bufferlist rdata;
     cluster_state.with_osdmap([&rdata](const OSDMap &osd_map){
-      osd_map.crush->encode(rdata);
+	osd_map.crush->encode(rdata, CEPH_FEATURES_SUPPORTED_DEFAULT);
     });
     std::string crush_text = rdata.to_str();
     return PyString_FromString(crush_text.c_str());
@@ -150,14 +151,6 @@ PyObject *PyModules::get_python(const std::string &what)
     cluster_state.with_monmap(
       [&f](const MonMap &monmap) {
         monmap.dump(&f);
-      }
-    );
-    return f.get();
-  } else if (what == "fs_map") {
-    PyFormatter f;
-    cluster_state.with_fsmap(
-      [&f](const FSMap &fsmap) {
-        fsmap.dump(&f);
       }
     );
     return f.get();
@@ -222,7 +215,7 @@ PyObject *PyModules::get_python(const std::string &what)
 
     cluster_state.with_osdmap([this, &f](const OSDMap &osd_map){
       cluster_state.with_pgmap(
-          [osd_map, &f](const PGMap &pg_map) {
+          [&osd_map, &f](const PGMap &pg_map) {
         pg_map.dump_fs_stats(nullptr, &f, true);
         pg_map.dump_pool_stats(osd_map, nullptr, &f, true);
       });
@@ -406,7 +399,7 @@ public:
   ServeThread(MgrPyModule *mod_)
     : mod(mod_) {}
 
-  void *entry()
+  void *entry() override
   {
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
@@ -445,7 +438,7 @@ void PyModules::shutdown()
   // Signal modules to drop out of serve()
   for (auto i : modules) {
     auto module = i.second;
-    finisher.queue(new C_StdFunction([module](){
+    finisher.queue(new FunctionContext([module](int r){
       module->shutdown();
     }));
   }
@@ -477,7 +470,7 @@ void PyModules::notify_all(const std::string &notify_type,
     auto module = i.second;
     // Send all python calls down a Finisher to avoid blocking
     // C++ code, and avoid any potential lock cycles.
-    finisher.queue(new C_StdFunction([module, notify_type, notify_id](){
+    finisher.queue(new FunctionContext([module, notify_type, notify_id](int r){
       module->notify(notify_type, notify_id);
     }));
   }

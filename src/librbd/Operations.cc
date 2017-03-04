@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "cls/rbd/cls_rbd_types.h"
 #include "librbd/Operations.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -12,6 +13,8 @@
 #include "librbd/ImageWatcher.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
+#include "librbd/journal/DisabledPolicy.h"
+#include "librbd/journal/StandardPolicy.h"
 #include "librbd/operation/DisableFeaturesRequest.h"
 #include "librbd/operation/EnableFeaturesRequest.h"
 #include "librbd/operation/FlattenRequest.h"
@@ -30,6 +33,7 @@
 #include "librbd/operation/SnapshotLimitRequest.h"
 #include <set>
 #include <boost/bind.hpp>
+#include <boost/scope_exit.hpp>
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -49,7 +53,7 @@ struct C_NotifyUpdate : public Context {
     : image_ctx(image_ctx), on_finish(on_finish) {
   }
 
-  virtual void complete(int r) override {
+  void complete(int r) override {
     CephContext *cct = image_ctx.cct;
     if (notified) {
       if (r == -ETIMEDOUT) {
@@ -77,7 +81,7 @@ struct C_NotifyUpdate : public Context {
     notified = true;
     image_ctx.notify_update(this);
   }
-  virtual void finish(int r) override {
+  void finish(int r) override {
     on_finish->complete(r);
   }
 };
@@ -199,18 +203,18 @@ struct C_InvokeAsyncRequest : public Context {
     CephContext *cct = image_ctx.cct;
     ldout(cct, 20) << __func__ << dendl;
 
-    Context *ctx = util::create_context_callback<
-      C_InvokeAsyncRequest<I>,
-      &C_InvokeAsyncRequest<I>::handle_acquire_exclusive_lock>(
-        this);
+    Context *ctx = util::create_async_context_callback(
+      image_ctx, util::create_context_callback<
+        C_InvokeAsyncRequest<I>,
+        &C_InvokeAsyncRequest<I>::handle_acquire_exclusive_lock>(this));
 
     if (request_lock) {
       // current lock owner doesn't support op -- try to perform
       // the action locally
       request_lock = false;
-      image_ctx.exclusive_lock->request_lock(ctx);
+      image_ctx.exclusive_lock->acquire_lock(ctx);
     } else {
-      image_ctx.exclusive_lock->try_lock(ctx);
+      image_ctx.exclusive_lock->try_acquire_lock(ctx);
     }
     owner_lock.put_read();
   }
@@ -295,7 +299,7 @@ struct C_InvokeAsyncRequest : public Context {
     complete(r);
   }
 
-  virtual void finish(int r) override {
+  void finish(int r) override {
     if (filter_error_codes.count(r) != 0) {
       r = 0;
     }
@@ -574,6 +578,9 @@ void Operations<I>::execute_rename(const std::string &dest_name,
     // unregister watch before and register back after rename
     on_finish = new C_NotifyUpdate<I>(m_image_ctx, on_finish);
     on_finish = new FunctionContext([this, on_finish](int r) {
+        if (m_image_ctx.old_format) {
+          m_image_ctx.image_watcher->set_oid(m_image_ctx.header_oid);
+        }
 	m_image_ctx.image_watcher->register_watch(on_finish);
       });
     on_finish = new FunctionContext([this, dest_name, on_finish](int r) {
@@ -605,7 +612,7 @@ int Operations<I>::resize(uint64_t size, bool allow_shrink, ProgressContext& pro
   }
 
   if (m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP) &&
-      !ObjectMap::is_compatible(m_image_ctx.layout, size)) {
+      !ObjectMap<>::is_compatible(m_image_ctx.layout, size)) {
     lderr(cct) << "New size not compatible with object map" << dendl;
     return -EINVAL;
   }
@@ -643,7 +650,7 @@ void Operations<I>::execute_resize(uint64_t size, bool allow_shrink, ProgressCon
     return;
   } else if (m_image_ctx.test_features(RBD_FEATURE_OBJECT_MAP,
                                        m_image_ctx.snap_lock) &&
-             !ObjectMap::is_compatible(m_image_ctx.layout, size)) {
+             !ObjectMap<>::is_compatible(m_image_ctx.layout, size)) {
     m_image_ctx.snap_lock.put_read();
     on_finish->complete(-EINVAL);
     return;
@@ -657,7 +664,8 @@ void Operations<I>::execute_resize(uint64_t size, bool allow_shrink, ProgressCon
 }
 
 template <typename I>
-int Operations<I>::snap_create(const char *snap_name) {
+int Operations<I>::snap_create(const char *snap_name,
+			       const cls::rbd::SnapshotNamespace &snap_namespace) {
   if (m_image_ctx.read_only) {
     return -EROFS;
   }
@@ -668,7 +676,7 @@ int Operations<I>::snap_create(const char *snap_name) {
   }
 
   C_SaferCond ctx;
-  snap_create(snap_name, &ctx);
+  snap_create(snap_name, snap_namespace, &ctx);
   r = ctx.wait();
 
   if (r < 0) {
@@ -680,7 +688,9 @@ int Operations<I>::snap_create(const char *snap_name) {
 }
 
 template <typename I>
-void Operations<I>::snap_create(const char *snap_name, Context *on_finish) {
+void Operations<I>::snap_create(const char *snap_name,
+				const cls::rbd::SnapshotNamespace &snap_namespace,
+				Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": snap_name=" << snap_name
                 << dendl;
@@ -700,16 +710,17 @@ void Operations<I>::snap_create(const char *snap_name, Context *on_finish) {
 
   C_InvokeAsyncRequest<I> *req = new C_InvokeAsyncRequest<I>(
     m_image_ctx, "snap_create", true,
-    boost::bind(&Operations<I>::execute_snap_create, this, snap_name, _1, 0,
-                false),
+    boost::bind(&Operations<I>::execute_snap_create, this, snap_name,
+		snap_namespace, _1, 0, false),
     boost::bind(&ImageWatcher<I>::notify_snap_create, m_image_ctx.image_watcher,
-                snap_name, _1),
+                snap_name, snap_namespace, _1),
     {-EEXIST}, on_finish);
   req->send();
 }
 
 template <typename I>
 void Operations<I>::execute_snap_create(const std::string &snap_name,
+					const cls::rbd::SnapshotNamespace &snap_namespace,
                                         Context *on_finish,
                                         uint64_t journal_op_tid,
                                         bool skip_object_map) {
@@ -732,7 +743,7 @@ void Operations<I>::execute_snap_create(const std::string &snap_name,
   operation::SnapshotCreateRequest<I> *req =
     new operation::SnapshotCreateRequest<I>(
       m_image_ctx, new C_NotifyUpdate<I>(m_image_ctx, on_finish), snap_name,
-      journal_op_tid, skip_object_map);
+      snap_namespace, journal_op_tid, skip_object_map);
   req->send();
 }
 
@@ -1012,6 +1023,11 @@ int Operations<I>::snap_protect(const char *snap_name) {
     return -EROFS;
   }
 
+  if (!m_image_ctx.test_features(RBD_FEATURE_LAYERING)) {
+    lderr(cct) << "image must support layering" << dendl;
+    return -ENOSYS;
+  }
+
   int r = m_image_ctx.state->refresh_if_required();
   if (r < 0) {
     return r;
@@ -1196,7 +1212,7 @@ int Operations<I>::snap_set_limit(uint64_t limit) {
 	!m_image_ctx.exclusive_lock->is_lock_owner()) {
       C_SaferCond lock_ctx;
 
-      m_image_ctx.exclusive_lock->request_lock(&lock_ctx);
+      m_image_ctx.exclusive_lock->acquire_lock(&lock_ctx);
       r = lock_ctx.wait();
       if (r < 0) {
 	return r;
@@ -1267,6 +1283,22 @@ int Operations<I>::update_features(uint64_t features, bool enabled) {
     }
   }
 
+  // if disabling journaling, avoid attempting to open the journal
+  // when acquiring the exclusive lock in case the journal is corrupt
+  bool disabling_journal = false;
+  if (!enabled && ((features & RBD_FEATURE_JOURNALING) != 0)) {
+    RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+    m_image_ctx.set_journal_policy(new journal::DisabledPolicy());
+    disabling_journal = true;
+  }
+  BOOST_SCOPE_EXIT_ALL( (this)(disabling_journal) ) {
+    if (disabling_journal) {
+      RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
+      m_image_ctx.set_journal_policy(
+        new journal::StandardPolicy<I>(&m_image_ctx));
+    }
+  };
+
   r = invoke_async_request("update_features", false,
                            boost::bind(&Operations<I>::execute_update_features,
                                        this, features, enabled, _1, 0),
@@ -1297,7 +1329,7 @@ void Operations<I>::execute_update_features(uint64_t features, bool enabled,
   } else {
     operation::DisableFeaturesRequest<I> *req =
       new operation::DisableFeaturesRequest<I>(
-        m_image_ctx, on_finish, journal_op_tid, features);
+        m_image_ctx, on_finish, journal_op_tid, features, false);
     req->send();
   }
 }
@@ -1313,8 +1345,9 @@ int Operations<I>::metadata_set(const std::string &key,
   size_t conf_prefix_len = start.size();
 
   if (key.size() > conf_prefix_len && !key.compare(0, conf_prefix_len, start)) {
+    // validate config setting
     string subkey = key.substr(conf_prefix_len, key.size() - conf_prefix_len);
-    int r = cct->_conf->set_val(subkey.c_str(), value);
+    int r = md_config_t().set_val(subkey.c_str(), value);
     if (r < 0) {
       return r;
     }
@@ -1337,7 +1370,7 @@ int Operations<I>::metadata_set(const std::string &key,
 	!m_image_ctx.exclusive_lock->is_lock_owner()) {
       C_SaferCond lock_ctx;
 
-      m_image_ctx.exclusive_lock->request_lock(&lock_ctx);
+      m_image_ctx.exclusive_lock->acquire_lock(&lock_ctx);
       r = lock_ctx.wait();
       if (r < 0) {
 	return r;
@@ -1392,7 +1425,7 @@ int Operations<I>::metadata_remove(const std::string &key) {
         !m_image_ctx.exclusive_lock->is_lock_owner()) {
       C_SaferCond lock_ctx;
 
-      m_image_ctx.exclusive_lock->request_lock(&lock_ctx);
+      m_image_ctx.exclusive_lock->acquire_lock(&lock_ctx);
       r = lock_ctx.wait();
       if (r < 0) {
         return r;
@@ -1437,7 +1470,7 @@ int Operations<I>::prepare_image_update() {
     if (m_image_ctx.exclusive_lock != nullptr &&
         (!m_image_ctx.exclusive_lock->is_lock_owner() ||
          !m_image_ctx.exclusive_lock->accept_requests(&r))) {
-      m_image_ctx.exclusive_lock->try_lock(&ctx);
+      m_image_ctx.exclusive_lock->try_acquire_lock(&ctx);
       trying_lock = true;
     }
   }

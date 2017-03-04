@@ -52,6 +52,7 @@
 
 #include "Locker.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef DOUT_COND
 #define DOUT_COND(cct, l) (l<=cct->_conf->debug_mds || l <= cct->_conf->debug_mds_log \
@@ -196,7 +197,8 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
       }
     }
     if (le) {
-      mds->mdlog->submit_entry(le, gather_bld.new_sub());
+      mds->mdlog->submit_entry(le);
+      mds->mdlog->wait_for_safe(gather_bld.new_sub());
       dout(10) << "try_to_expire waiting for open files to rejournal" << dendl;
     }
   }
@@ -495,10 +497,11 @@ void EMetaBlob::fullbit::dump(Formatter *f) const
   f->open_object_section("inode");
   inode.dump(f);
   f->close_section(); // inode
-  f->open_array_section("xattrs");
+  f->open_object_section("xattrs");
   for (map<string, bufferptr>::const_iterator iter = xattrs.begin();
       iter != xattrs.end(); ++iter) {
-    f->dump_string(iter->first.c_str(), iter->second.c_str());
+    string s(iter->second.c_str(), iter->second.length());
+    f->dump_string(iter->first.c_str(), s);
   }
   f->close_section(); // xattrs
   if (inode.is_symlink()) {
@@ -597,7 +600,7 @@ void EMetaBlob::fullbit::update_inode(MDSRank *mds, CInode *in)
           << std::dec << " in journal";
       mds->clog->error() << oss.str();
       mds->damaged();
-      assert(0);  // Should be unreachable because damaged() calls respawn()
+      ceph_abort();  // Should be unreachable because damaged() calls respawn()
     }
   }
 }
@@ -1213,7 +1216,7 @@ void EMetaBlob::replay(MDSRank *mds, LogSegment *logseg, MDSlaveUpdate *slaveup)
 	  dout(0) << "EMetaBlob.replay missing dir ino  " << (*lp).ino << dendl;
           mds->clog->error() << "failure replaying journal (EMetaBlob)";
           mds->damaged();
-          assert(0);  // Should be unreachable because damaged() calls respawn()
+          ceph_abort();  // Should be unreachable because damaged() calls respawn()
 	}
       }
 
@@ -1568,11 +1571,7 @@ void EMetaBlob::replay(MDSRank *mds, LogSegment *logseg, MDSlaveUpdate *slaveup)
       if (session) {
 	dout(20) << " (session prealloc " << session->info.prealloc_inos << ")" << dendl;
 	if (used_preallocated_ino) {
-	  if (session->info.prealloc_inos.empty()) {
-	    // HRM: badness in the journal
-	    mds->clog->warn() << " replayed op " << client_reqs << " on session for "
-			     << client_name << " with empty prealloc_inos\n";
-	  } else {
+	  if (!session->info.prealloc_inos.empty()) {
 	    inodeno_t next = session->next_ino();
 	    inodeno_t i = session->take_ino(used_preallocated_ino);
 	    if (next != i)
@@ -1959,7 +1958,7 @@ void ETableServer::replay(MDSRank *mds)
   default:
     mds->clog->error() << "invalid tableserver op in ETableServer";
     mds->damaged();
-    assert(0);  // Should be unreachable because damaged() calls respawn()
+    ceph_abort();  // Should be unreachable because damaged() calls respawn()
   }
   
   assert(version == server->get_version());
@@ -2130,11 +2129,9 @@ void EUpdate::replay(MDSRank *mds)
 	       << " < " << cmapv << dendl;
       // open client sessions?
       map<client_t,entity_inst_t> cm;
-      map<client_t, uint64_t> seqm;
       bufferlist::iterator blp = client_map.begin();
       ::decode(cm, blp);
-      mds->server->prepare_force_open_sessions(cm, seqm);
-      mds->server->finish_force_open_sessions(cm, seqm);
+      mds->sessionmap.open_sessions(cm);
 
       assert(mds->sessionmap.get_version() == cmapv);
       mds->sessionmap.set_projected(mds->sessionmap.get_version());
@@ -2525,7 +2522,7 @@ void ESlaveUpdate::replay(MDSRank *mds)
   default:
     mds->clog->error() << "invalid op in ESlaveUpdate";
     mds->damaged();
-    assert(0);  // Should be unreachable because damaged() calls respawn()
+    ceph_abort();  // Should be unreachable because damaged() calls respawn()
   }
 }
 
@@ -2743,8 +2740,7 @@ void EFragment::replay(MDSRank *mds)
   switch (op) {
   case OP_PREPARE:
     mds->mdcache->add_uncommitted_fragment(dirfrag_t(ino, basefrag), bits, orig_frags, _segment, &rollback);
-    // fall-thru
-  case OP_ONESHOT:
+
     if (in)
       mds->mdcache->adjust_dir_fragments(in, basefrag, bits, resultfrags, waiters, true);
     break;
@@ -2769,7 +2765,7 @@ void EFragment::replay(MDSRank *mds)
     break;
 
   default:
-    assert(0);
+    ceph_abort();
   }
 
   metablob.replay(mds, _segment);
@@ -2796,8 +2792,6 @@ void EFragment::decode(bufferlist::iterator &bl) {
     ::decode(stamp, bl);
   if (struct_v >= 3)
     ::decode(op, bl);
-  else
-    op = OP_ONESHOT;
   ::decode(ino, bl);
   ::decode(basefrag, bl);
   ::decode(bits, bl);
@@ -3032,7 +3026,7 @@ void EImportFinish::replay(MDSRank *mds)
 	     << dendl;
     mds->clog->error() << "failure replaying journal (EImportFinish)";
     mds->damaged();
-    assert(0);  // Should be unreachable because damaged() calls respawn()
+    ceph_abort();  // Should be unreachable because damaged() calls respawn()
   }
 }
 

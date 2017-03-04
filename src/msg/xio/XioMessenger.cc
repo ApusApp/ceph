@@ -52,8 +52,6 @@ static const level_pair LEVELS[] = {
   make_pair("trace", 20)
 };
 
-// maintain our own global context, we can't rely on g_ceph_context
-// for things like librados
 static CephContext *context;
 
 int get_level()
@@ -378,13 +376,13 @@ XioMessenger::XioMessenger(CephContext *cct, entity_name_t name,
   /* update class instance count */
   nInstances.inc();
 
-  loop_con->set_features(features);
+  loop_con->set_features(CEPH_FEATURES_ALL);
 
   ldout(cct,2) << "Create msgr: " << this << " instance: "
     << nInstances.read() << " type: " << name.type_str()
     << " subtype: " << mname << " nportals: " << get_nportals(cflags)
-    << " nconns_per_portal: " << get_nconns_per_portal(cflags) << " features: "
-    << features << dendl;
+    << " nconns_per_portal: " << get_nconns_per_portal(cflags)
+    << dendl;
 
 } /* ctor */
 

@@ -26,7 +26,6 @@
 
 class PosixWorker : public Worker {
   NetHandler net;
-  std::thread t;
   virtual void initialize();
  public:
   PosixWorker(CephContext *c, unsigned i)
@@ -50,7 +49,7 @@ class PosixNetworkStack : public NetworkStack {
   }
   virtual void spawn_worker(unsigned i, std::function<void ()> &&func) override {
     threads.resize(i+1);
-    threads[i] = std::move(std::thread(func));
+    threads[i] = std::thread(func);
   }
   virtual void join_worker(unsigned i) override {
     assert(threads.size() > i && threads[i].joinable());

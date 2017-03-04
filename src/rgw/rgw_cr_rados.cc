@@ -5,6 +5,7 @@
 
 #include "cls/lock/cls_lock_client.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 bool RGWAsyncRadosProcessor::RGWWQ::_enqueue(RGWAsyncRadosRequest *req) {
@@ -284,7 +285,7 @@ int RGWRadosGetOmapKeysCR::send_request() {
   set_status() << "send request";
 
   librados::ObjectReadOperation op;
-  op.omap_get_vals(marker, max_entries, entries, &rval);
+  op.omap_get_vals2(marker, max_entries, entries, nullptr, &rval);
 
   cn = stack->create_completion_notifier();
   return ioctx.aio_operate(oid, cn->completion(), &op, NULL);
@@ -333,8 +334,7 @@ RGWSimpleRadosLockCR::RGWSimpleRadosLockCR(RGWAsyncRadosProcessor *_async_rados,
                                                 pool(_pool), oid(_oid),
                                                 req(NULL)
 {
-  stringstream s;
-  s << "rados lock dest=" << pool << "/" << oid << " lock=" << lock_name << " cookie=" << cookie << " duration=" << duration;
+  set_description() << "rados lock dest=" << pool << "/" << oid << " lock=" << lock_name << " cookie=" << cookie << " duration=" << duration;
 }
 
 void RGWSimpleRadosLockCR::request_cleanup()

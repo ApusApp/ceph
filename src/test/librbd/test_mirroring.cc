@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -13,15 +13,15 @@
  */
 #include "test/librbd/test_fixture.h"
 #include "test/librbd/test_support.h"
-#include "librbd/AioCompletion.h"
-#include "librbd/AioImageRequest.h"
-#include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageState.h"
 #include "librbd/ImageWatcher.h"
 #include "librbd/internal.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Operations.h"
+#include "librbd/io/AioCompletion.h"
+#include "librbd/io/ImageRequest.h"
+#include "librbd/io/ImageRequestWQ.h"
 #include "librbd/journal/Types.h"
 #include "journal/Journaler.h"
 #include "journal/Settings.h"
@@ -39,13 +39,13 @@ public:
   TestMirroring() {}
 
 
-  virtual void TearDown() {
+  void TearDown() override {
     unlock_image();
 
     TestFixture::TearDown();
   }
 
-  virtual void SetUp() {
+  void SetUp() override {
     ASSERT_EQ(0, _rados.ioctx_create(_pool_name.c_str(), m_ioctx));
   }
 
@@ -239,7 +239,7 @@ public:
   }
 
   void check_remove_image(rbd_mirror_mode_t mirror_mode, uint64_t features,
-                          bool enable_mirroring) {
+                          bool enable_mirroring, bool demote = false) {
 
     ASSERT_EQ(0, m_rbd.mirror_mode_set(m_ioctx, mirror_mode));
 
@@ -251,6 +251,11 @@ public:
 
     if (enable_mirroring) {
       ASSERT_EQ(0, image.mirror_image_enable());
+    }
+
+    if (demote) {
+      ASSERT_EQ(0, image.mirror_image_demote());
+      ASSERT_EQ(0, image.mirror_image_disable(true));
     }
 
     image.close();
@@ -608,6 +613,12 @@ TEST_F(TestMirroring, RemoveImage_With_ImageWithoutJournal) {
                      false);
 }
 
+TEST_F(TestMirroring, RemoveImage_With_MirrorImageDemoted) {
+  check_remove_image(RBD_MIRROR_MODE_IMAGE,
+                     RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_JOURNALING,
+                     true, true);
+}
+
 TEST_F(TestMirroring, MirrorStatusList) {
   std::vector<uint64_t>
       features_vec(5, RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_JOURNALING);
@@ -632,4 +643,41 @@ TEST_F(TestMirroring, MirrorStatusList) {
   images.clear();
   ASSERT_EQ(0, m_rbd.mirror_image_status_list(m_ioctx, last_read, 4096, &images));
   ASSERT_EQ(0U, images.size());
+}
+
+TEST_F(TestMirroring, RemoveBootstrapped)
+{
+  ASSERT_EQ(0, m_rbd.mirror_mode_set(m_ioctx, RBD_MIRROR_MODE_POOL));
+
+  uint64_t features = RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_JOURNALING;
+  int order = 20;
+  ASSERT_EQ(0, m_rbd.create2(m_ioctx, image_name.c_str(), 4096, features,
+                             &order));
+  librbd::Image image;
+  ASSERT_EQ(0, m_rbd.open(m_ioctx, image, image_name.c_str()));
+  ASSERT_EQ(-EBUSY, m_rbd.remove(m_ioctx, image_name.c_str()));
+
+  // simulate the image is open by rbd-mirror bootstrap
+  uint64_t handle;
+  struct MirrorWatcher : public librados::WatchCtx2 {
+    MirrorWatcher(librados::IoCtx &ioctx) : m_ioctx(ioctx) {
+    }
+    void handle_notify(uint64_t notify_id, uint64_t cookie,
+                               uint64_t notifier_id, bufferlist& bl) override {
+      // received IMAGE_UPDATED notification from remove
+      m_notified = true;
+      m_ioctx.notify_ack(RBD_MIRRORING, notify_id, cookie, bl);
+    }
+    void handle_error(uint64_t cookie, int err) override {
+    }
+    librados::IoCtx &m_ioctx;
+    bool m_notified = false;
+  } watcher(m_ioctx);
+  ASSERT_EQ(0, m_ioctx.create(RBD_MIRRORING, false));
+  ASSERT_EQ(0, m_ioctx.watch2(RBD_MIRRORING, &handle, &watcher));
+  // now remove should succeed
+  ASSERT_EQ(0, m_rbd.remove(m_ioctx, image_name.c_str()));
+  ASSERT_EQ(0, m_ioctx.unwatch2(handle));
+  ASSERT_TRUE(watcher.m_notified);
+  ASSERT_EQ(0, image.close());
 }

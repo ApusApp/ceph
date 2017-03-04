@@ -106,7 +106,7 @@ class C_Updated : public Context {
 public:
   C_Updated(MgrMonitor *a, MonOpRequestRef c) :
     mm(a), op(c) {}
-  void finish(int r) {
+  void finish(int r) override {
     if (r >= 0) {
       // Success 
     } else if (r == -ECANCELED) {
@@ -122,7 +122,7 @@ bool MgrMonitor::preprocess_beacon(MonOpRequestRef op)
   MMgrBeacon *m = static_cast<MMgrBeacon*>(op->get_req());
   dout(4) << "beacon from " << m->get_gid() << dendl;
 
-  last_beacon[m->get_gid()] = ceph_clock_now(g_ceph_context);
+  last_beacon[m->get_gid()] = ceph_clock_now();
 
   if (pending_map.active_gid == m->get_gid()
       && pending_map.active_addr == m->get_server_addr()
@@ -163,7 +163,7 @@ bool MgrMonitor::prepare_beacon(MonOpRequestRef op)
     }
   }
 
-  last_beacon[m->get_gid()] = ceph_clock_now(g_ceph_context);
+  last_beacon[m->get_gid()] = ceph_clock_now();
 
   // Track whether we modified pending_map
   bool updated = false;
@@ -190,7 +190,7 @@ bool MgrMonitor::prepare_beacon(MonOpRequestRef op)
     pending_map.active_name = m->get_name();
 
     dout(4) << "selecting new active in epoch " << pending_map.epoch << dendl;
-    wait_for_finished_proposal(op, new C_Updated(this, op));
+    updated = true;
   } else {
     if (pending_map.standbys.count(m->get_gid()) > 0) {
       dout(10) << "from existing standby " << m->get_gid() << dendl;
@@ -268,15 +268,15 @@ void MgrMonitor::send_digests()
     sub->session->con->send_message(mdigest);
   }
 
-  digest_callback = new C_StdFunction([this](){
+  digest_callback = new FunctionContext([this](int r){
       send_digests();
   });
-  mon->timer.add_event_after(5, digest_callback);
+  mon->timer.add_event_after(g_conf->mon_mgr_digest_period, digest_callback);
 }
 
 void MgrMonitor::tick()
 {
-  const utime_t now = ceph_clock_now(g_ceph_context);
+  const utime_t now = ceph_clock_now();
   utime_t cutoff = now;
   cutoff -= g_conf->mon_mgr_beacon_grace;
 
@@ -421,6 +421,7 @@ bool MgrMonitor::prepare_command(MonOpRequestRef op)
         for (const auto &i : pending_map.standbys) {
           if (i.second.name == who) {
             gid = i.first;
+            break;
           }
         }
         if (gid != 0) {

@@ -39,8 +39,8 @@ struct TypeTraits<librbd::MockTestImageCtx> {
 } // namespace librbd
 
 // template definitions
-#include "tools/rbd_mirror/ImageSync.cc"
 template class rbd::mirror::ImageSync<librbd::MockTestImageCtx>;
+#include "tools/rbd_mirror/ImageSync.cc"
 
 namespace rbd {
 namespace mirror {
@@ -180,7 +180,7 @@ public:
   typedef image_sync::SyncPointCreateRequest<librbd::MockTestImageCtx> MockSyncPointCreateRequest;
   typedef image_sync::SyncPointPruneRequest<librbd::MockTestImageCtx> MockSyncPointPruneRequest;
 
-  virtual void SetUp() {
+  void SetUp() override {
     TestMockFixture::SetUp();
 
     librbd::RBD rbd;

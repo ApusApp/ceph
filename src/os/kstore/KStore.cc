@@ -20,7 +20,8 @@
 #include <unistd.h>
 
 #include "KStore.h"
-#include "kv.h"
+#include "osd/osd_types.h"
+#include "os/kv.h"
 #include "include/compat.h"
 #include "include/stringify.h"
 #include "common/errno.h"
@@ -28,6 +29,7 @@
 #include "common/Formatter.h"
 
 
+#define dout_context cct
 #define dout_subsys ceph_subsys_kstore
 
 /*
@@ -84,10 +86,10 @@ static void append_escaped(const string &in, string *out)
   char hexbyte[8];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
     if (*i <= '#') {
-      snprintf(hexbyte, sizeof(hexbyte), "#%02x", (unsigned)*i);
+      snprintf(hexbyte, sizeof(hexbyte), "#%02x", (uint8_t)*i);
       out->append(hexbyte);
     } else if (*i >= '~') {
-      snprintf(hexbyte, sizeof(hexbyte), "~%02x", (unsigned)*i);
+      snprintf(hexbyte, sizeof(hexbyte), "~%02x", (uint8_t)*i);
       out->append(hexbyte);
     } else {
       out->push_back(*i);
@@ -247,7 +249,8 @@ static void get_coll_key_range(const coll_t& cid, int bits,
 
 static int get_key_object(const string& key, ghobject_t *oid);
 
-static void get_object_key(const ghobject_t& oid, string *key)
+static void get_object_key(CephContext* cct, const ghobject_t& oid,
+			   string *key)
 {
   key->clear();
 
@@ -456,7 +459,7 @@ void KStore::OnodeHashLRU::clear()
 }
 
 void KStore::OnodeHashLRU::rename(const ghobject_t& old_oid,
-				    const ghobject_t& new_oid)
+				  const ghobject_t& new_oid)
 {
   std::lock_guard<std::mutex> l(lock);
   dout(30) << __func__ << " " << old_oid << " -> " << new_oid << dendl;
@@ -473,14 +476,14 @@ void KStore::OnodeHashLRU::rename(const ghobject_t& old_oid,
   OnodeRef o = po->second;
 
   // install a non-existent onode it its place
-  po->second.reset(new Onode(old_oid, o->key));
+  po->second.reset(new Onode(cct, old_oid, o->key));
   lru.push_back(*po->second);
 
   // fix oid, key
   onode_map.insert(make_pair(new_oid, o));
   _touch(o);
   o->oid = new_oid;
-  get_object_key(new_oid, &o->key);
+  get_object_key(cct, new_oid, &o->key);
 }
 
 bool KStore::OnodeHashLRU::get_next(
@@ -561,7 +564,7 @@ KStore::Collection::Collection(KStore *ns, coll_t c)
   : store(ns),
     cid(c),
     lock("KStore::Collection::lock", true, false),
-    onode_map()
+    onode_map(store->cct)
 {
 }
 
@@ -574,9 +577,9 @@ KStore::OnodeRef KStore::Collection::get_onode(
   spg_t pgid;
   if (cid.is_pg(&pgid)) {
     if (!oid.match(cnode.bits, pgid.ps())) {
-      derr << __func__ << " oid " << oid << " not part of " << pgid
-	   << " bits " << cnode.bits << dendl;
-      assert(0);
+      lderr(store->cct) << __func__ << " oid " << oid << " not part of "
+			<< pgid << " bits " << cnode.bits << dendl;
+      ceph_abort();
     }
   }
 
@@ -585,14 +588,14 @@ KStore::OnodeRef KStore::Collection::get_onode(
     return o;
 
   string key;
-  get_object_key(oid, &key);
+  get_object_key(store->cct, oid, &key);
 
-  dout(20) << __func__ << " oid " << oid << " key "
-	   << pretty_binary_string(key) << dendl;
+  ldout(store->cct, 20) << __func__ << " oid " << oid << " key "
+			<< pretty_binary_string(key) << dendl;
 
   bufferlist v;
   int r = store->db->get(PREFIX_OBJ, key, &v);
-  dout(20) << " r " << r << " v.len " << v.length() << dendl;
+  ldout(store->cct, 20) << " r " << r << " v.len " << v.length() << dendl;
   Onode *on;
   if (v.length() == 0) {
     assert(r == -ENOENT);
@@ -600,12 +603,12 @@ KStore::OnodeRef KStore::Collection::get_onode(
       return OnodeRef();
 
     // new
-    on = new Onode(oid, key);
+    on = new Onode(store->cct, oid, key);
     on->dirty = true;
   } else {
     // loaded
     assert(r >=0);
-    on = new Onode(oid, key);
+    on = new Onode(store->cct, oid, key);
     on->exists = true;
     bufferlist::iterator p = v.begin();
     ::decode(on->onode, p);
@@ -623,20 +626,20 @@ KStore::OnodeRef KStore::Collection::get_onode(
 #define dout_prefix *_dout << "kstore(" << path << ") "
 
 KStore::KStore(CephContext *cct, const string& path)
-  : ObjectStore(path),
-    cct(cct),
+  : ObjectStore(cct, path),
     db(NULL),
     path_fd(-1),
     fsid_fd(-1),
     mounted(false),
     coll_lock("KStore::coll_lock"),
+    nid_last(0),
     nid_max(0),
     throttle_ops(cct, "kstore_max_ops", cct->_conf->kstore_max_ops),
     throttle_bytes(cct, "kstore_max_bytes", cct->_conf->kstore_max_bytes),
     finisher(cct),
     kv_sync_thread(this),
     kv_stop(false),
-    logger(NULL)
+    logger(nullptr)
 {
   _init_logger();
 }
@@ -652,7 +655,7 @@ KStore::~KStore()
 void KStore::_init_logger()
 {
   // XXX
-  PerfCountersBuilder b(g_ceph_context, "KStore",
+  PerfCountersBuilder b(cct, "KStore",
                         l_kstore_first, l_kstore_last);
   b.add_time_avg(l_kstore_state_prepare_lat, "state_prepare_lat", "Average prepare state latency");
   b.add_time_avg(l_kstore_state_kv_queued_lat, "state_kv_queued_lat", "Average kv_queued state latency");
@@ -660,13 +663,13 @@ void KStore::_init_logger()
   b.add_time_avg(l_kstore_state_finishing_lat, "state_finishing_lat", "Average finishing state latency");
   b.add_time_avg(l_kstore_state_done_lat, "state_done_lat", "Average done state latency");
   logger = b.create_perf_counters();
-  g_ceph_context->get_perfcounters_collection()->add(logger);
+  cct->get_perfcounters_collection()->add(logger);
 }
 
 void KStore::_shutdown_logger()
 {
   // XXX
-  g_ceph_context->get_perfcounters_collection()->remove(logger);
+  cct->get_perfcounters_collection()->remove(logger);
   delete logger;
 }
 
@@ -802,7 +805,7 @@ int KStore::_open_db(bool create)
 
   string kv_backend;
   if (create) {
-    kv_backend = g_conf->kstore_backend;
+    kv_backend = cct->_conf->kstore_backend;
   } else {
     r = read_meta("kv_backend", &kv_backend);
     if (r < 0) {
@@ -836,16 +839,14 @@ int KStore::_open_db(bool create)
     }
   }
 
-  db = KeyValueDB::create(g_ceph_context,
-			  kv_backend,
-			  fn);
+  db = KeyValueDB::create(cct, kv_backend, fn);
   if (!db) {
     derr << __func__ << " error creating db" << dendl;
     return -EIO;
   }
   string options;
   if (kv_backend == "rocksdb")
-    options = g_conf->kstore_rocksdb_options;
+    options = cct->_conf->kstore_rocksdb_options;
   db->init(options);
   stringstream err;
   if (create)
@@ -943,7 +944,7 @@ int KStore::mkfs()
   if (r < 0)
     goto out_close_fsid;
 
-  r = write_meta("kv_backend", g_conf->kstore_backend);
+  r = write_meta("kv_backend", cct->_conf->kstore_backend);
   if (r < 0)
     goto out_close_db;
 
@@ -971,8 +972,8 @@ int KStore::mount()
 {
   dout(1) << __func__ << " path " << path << dendl;
 
-  if (g_conf->kstore_fsck_on_mount) {
-    int rc = fsck();
+  if (cct->_conf->kstore_fsck_on_mount) {
+    int rc = fsck(cct->_conf->kstore_fsck_on_mount_deep);
     if (rc < 0)
       return rc;
   }
@@ -1043,7 +1044,7 @@ int KStore::umount()
   return 0;
 }
 
-int KStore::fsck()
+int KStore::fsck(bool deep)
 {
   dout(1) << __func__ << dendl;
   int errors = 0;
@@ -1153,6 +1154,13 @@ int KStore::stat(
   st->st_blocks = (st->st_size + st->st_blksize - 1) / st->st_blksize;
   st->st_nlink = 1;
   return 0;
+}
+
+int KStore::set_collection_opts(
+  const coll_t& cid,
+  const pool_opts_t& opts)
+{
+  return -EOPNOTSUPP;
 }
 
 int KStore::read(
@@ -1380,7 +1388,7 @@ int KStore::collection_empty(const coll_t& cid, bool *empty)
   dout(15) << __func__ << " " << cid << dendl;
   vector<ghobject_t> ls;
   ghobject_t next;
-  int r = collection_list(cid, ghobject_t(), ghobject_t::get_max(), true, 1,
+  int r = collection_list(cid, ghobject_t(), ghobject_t::get_max(), 1,
 			  &ls, &next);
   if (r < 0) {
     derr << __func__ << " collection_list returned: " << cpp_strerror(r)
@@ -1393,18 +1401,40 @@ int KStore::collection_empty(const coll_t& cid, bool *empty)
 }
 
 int KStore::collection_list(
-  const coll_t& cid, ghobject_t start, ghobject_t end,
-  bool sort_bitwise, int max,
+  const coll_t& cid, const ghobject_t& start, const ghobject_t& end, int max,
   vector<ghobject_t> *ls, ghobject_t *pnext)
 {
-  dout(15) << __func__ << " " << cid
-	   << " start " << start << " end " << end << " max " << max << dendl;
-  if (!sort_bitwise)
-    return -EOPNOTSUPP;
-  CollectionRef c = _get_collection(cid);
+  CollectionHandle c = _get_collection(cid);
   if (!c)
     return -ENOENT;
-  RWLock::RLocker l(c->lock);
+  return collection_list(c, start, end, max, ls, pnext);
+}
+
+int KStore::collection_list(
+  CollectionHandle &c_, const ghobject_t& start, const ghobject_t& end, int max,
+  vector<ghobject_t> *ls, ghobject_t *pnext)
+
+{
+  Collection *c = static_cast<Collection*>(c_.get());
+  dout(15) << __func__ << " " << c->cid
+           << " start " << start << " end " << end << " max " << max << dendl;
+  int r;
+  {
+    RWLock::RLocker l(c->lock);
+    r = _collection_list(c, start, end, max, ls, pnext);
+  }
+
+  dout(10) << __func__ << " " << c->cid
+    << " start " << start << " end " << end << " max " << max
+    << " = " << r << ", ls.size() = " << ls->size()
+    << ", next = " << (pnext ? *pnext : ghobject_t())  << dendl;
+  return r;
+}
+
+int KStore::_collection_list(
+  Collection* c, const ghobject_t& start, const ghobject_t& end, int max,
+  vector<ghobject_t> *ls, ghobject_t *pnext)
+{
   int r = 0;
   KeyValueDB::Iterator it;
   string temp_start_key, temp_end_key;
@@ -1417,9 +1447,11 @@ int KStore::collection_list(
   if (!pnext)
     pnext = &static_next;
 
-  if (start == ghobject_t::get_max())
+  if (start == ghobject_t::get_max() ||
+    start.hobj.is_max()) {
     goto out;
-  get_coll_key_range(cid, c->cnode.bits, &temp_start_key, &temp_end_key,
+  }
+  get_coll_key_range(c->cid, c->cnode.bits, &temp_start_key, &temp_end_key,
 		     &start_key, &end_key);
   dout(20) << __func__
 	   << " range " << pretty_binary_string(temp_start_key)
@@ -1428,12 +1460,12 @@ int KStore::collection_list(
 	   << " to " << pretty_binary_string(end_key)
 	   << " start " << start << dendl;
   it = db->get_iterator(PREFIX_OBJ);
-  if (start == ghobject_t() || start == cid.get_min_hobj()) {
+  if (start == ghobject_t() || start == c->cid.get_min_hobj()) {
     it->upper_bound(temp_start_key);
     temp = true;
   } else {
     string k;
-    get_object_key(start, &k);
+    get_object_key(cct, start, &k);
     if (start.hobj.is_temp()) {
       temp = true;
       assert(k >= temp_start_key && k < temp_end_key);
@@ -1448,7 +1480,7 @@ int KStore::collection_list(
   if (end.hobj.is_max()) {
     pend = temp ? temp_end_key : end_key;
   } else {
-    get_object_key(end, &end_key);
+    get_object_key(cct, end, &end_key);
     if (end.hobj.is_temp()) {
       if (temp)
 	pend = end_key;
@@ -1460,7 +1492,7 @@ int KStore::collection_list(
   }
   dout(20) << __func__ << " pend " << pretty_binary_string(pend) << dendl;
   while (true) {
-    if (!it->valid() || it->key() > pend) {
+    if (!it->valid() || it->key() >= pend) {
       if (!it->valid())
 	dout(20) << __func__ << " iterator not valid (end of db?)" << dendl;
       else
@@ -1492,14 +1524,10 @@ int KStore::collection_list(
     ls->push_back(oid);
     it->next();
   }
+out:
   if (!set_next) {
     *pnext = ghobject_t::get_max();
   }
- out:
-  dout(10) << __func__ << " " << cid
-	   << " start " << start << " end " << end << " max " << max
-	   << " = " << r << ", ls.size() = " << ls->size()
-	   << ", next = " << *pnext << dendl;
   return r;
 }
 
@@ -1851,7 +1879,7 @@ void KStore::_assign_nid(TransContext *txc, OnodeRef o)
   o->onode.nid = ++nid_last;
   dout(20) << __func__ << " " << o->oid << " nid " << o->onode.nid << dendl;
   if (nid_last > nid_max) {
-    nid_max += g_conf->kstore_nid_prealloc;
+    nid_max += cct->_conf->kstore_nid_prealloc;
     bufferlist bl;
     ::encode(nid_max, bl);
     txc->t->set(PREFIX_SUPER, "nid_max", bl);
@@ -1877,9 +1905,9 @@ void KStore::_txc_state_proc(TransContext *txc)
     case TransContext::STATE_PREPARE:
       txc->log_state_latency(logger, l_kstore_state_prepare_lat);
       txc->state = TransContext::STATE_KV_QUEUED;
-      if (!g_conf->kstore_sync_transaction) {
+      if (!cct->_conf->kstore_sync_transaction) {
 	std::lock_guard<std::mutex> l(kv_lock);
-	if (g_conf->kstore_sync_submit_transaction) {
+	if (cct->_conf->kstore_sync_submit_transaction) {
           int r = db->submit_transaction(txc->t);
 	  assert(r == 0);
 	}
@@ -1954,9 +1982,8 @@ void KStore::_txc_finish_kv(TransContext *txc)
     finisher.queue(txc->oncommit);
     txc->oncommit = NULL;
   }
-  while (!txc->oncommits.empty()) {
-    finisher.queue(txc->oncommits.front());
-    txc->oncommits.pop_front();
+  if (!txc->oncommits.empty()) {
+    finisher.queue(txc->oncommits);
   }
 
   throttle_ops.put(txc->ops);
@@ -2012,7 +2039,7 @@ void KStore::_osr_reap_done(OpSequencer *osr)
     }
 
     if (txc->first_collection) {
-      txc->first_collection->onode_map.trim(g_conf->kstore_onode_map_size);
+      txc->first_collection->onode_map.trim(cct->_conf->kstore_onode_map_size);
     }
 
     osr->q.pop_front();
@@ -2040,14 +2067,14 @@ void KStore::_kv_sync_thread()
     } else {
       dout(20) << __func__ << " committing " << kv_queue.size() << dendl;
       kv_committing.swap(kv_queue);
-      utime_t start = ceph_clock_now(NULL);
+      utime_t start = ceph_clock_now();
       l.unlock();
 
       dout(30) << __func__ << " committing txc " << kv_committing << dendl;
 
       // one transaction to force a sync
       KeyValueDB::Transaction t = db->get_transaction();
-      if (!g_conf->kstore_sync_submit_transaction) {
+      if (!cct->_conf->kstore_sync_submit_transaction) {
 	for (std::deque<TransContext *>::iterator it = kv_committing.begin();
 	     it != kv_committing.end();
 	     ++it) {
@@ -2057,7 +2084,7 @@ void KStore::_kv_sync_thread()
       }
       int r = db->submit_transaction_sync(t);
       assert(r == 0);
-      utime_t finish = ceph_clock_now(NULL);
+      utime_t finish = ceph_clock_now();
       utime_t dur = finish - start;
       dout(20) << __func__ << " committed " << kv_committing.size()
 	       << " in " << dur << dendl;
@@ -2099,7 +2126,7 @@ int KStore::queue_transactions(
     osr = static_cast<OpSequencer *>(posr->p.get());
     dout(10) << __func__ << " existing " << osr << " " << *osr << dendl;
   } else {
-    osr = new OpSequencer;
+    osr = new OpSequencer(cct);
     osr->parent = posr;
     posr->p = osr;
     dout(10) << __func__ << " new " << osr << " " << *osr << dendl;
@@ -2231,9 +2258,9 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       break;
     }
     if (r < 0) {
-      dout(0) << " error " << cpp_strerror(r)
-	      << " not handled on operation " << op->op
-	      << " (op " << pos << ", counting from 0)" << dendl;
+      derr << " error " << cpp_strerror(r)
+	   << " not handled on operation " << op->op
+	   << " (op " << pos << ", counting from 0)" << dendl;
       dout(0) << " transaction dump:\n";
       JSONFormatter f(true);
       f.open_object_section("transaction");
@@ -2363,16 +2390,6 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       }
       break;
 
-    case Transaction::OP_MERGE_DELETE:
-      {
-        const ghobject_t& boid = i.get_oid(op->dest_oid);
-        OnodeRef bo = c->get_onode(boid, true);
-        vector<boost::tuple<uint64_t, uint64_t, uint64_t>> move_info;
-        i.decode_move_info(move_info);
-        r = _move_ranges_destroy_src(txc, c, o, cvec[op->dest_cid], bo, move_info);
-      }
-      break;
-
     case Transaction::OP_COLL_ADD:
       assert(0 == "not implemented");
       break;
@@ -2455,7 +2472,7 @@ void KStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 
     default:
       derr << "bad op " << op->op << dendl;
-      assert(0);
+      ceph_abort();
     }
 
   endop:
@@ -2589,7 +2606,7 @@ int KStore::_do_write(TransContext *txc,
 
   uint64_t stripe_size = o->onode.stripe_size;
   if (!stripe_size) {
-    o->onode.stripe_size = g_conf->kstore_default_stripe_size;
+    o->onode.stripe_size = cct->_conf->kstore_default_stripe_size;
     stripe_size = o->onode.stripe_size;
   }
 
@@ -2819,7 +2836,7 @@ int KStore::_do_remove(TransContext *txc,
   o->exists = false;
   o->onode = kstore_onode_t();
   txc->onodes.erase(o);
-  get_object_key(o->oid, &key);
+  get_object_key(cct, o->oid, &key);
   txc->t->rmkey(PREFIX_OBJ, key);
   return 0;
 }
@@ -3182,48 +3199,6 @@ int KStore::_clone_range(TransContext *txc,
   return r;
 }
 
-/* Move contents of src object according to move_info to base object.
- * Once the move_info is traversed completely, delete the src object.
- */
-int KStore::_move_ranges_destroy_src(TransContext *txc,
-                           CollectionRef& c,
-                           OnodeRef& srco,
-                           CollectionRef& basec,
-                           OnodeRef& baseo,
-                           vector<boost::tuple<uint64_t, uint64_t, uint64_t>> move_info)
-{
-  int r = 0;
-  bufferlist bl;
-  baseo->exists = true;
-  _assign_nid(txc, baseo);
-
-// Traverse move_info completely, move contents from src to base object.
-  for (unsigned i = 0; i < move_info.size(); ++i) {
-    uint64_t srcoff;
-    uint64_t dstoff;
-    uint64_t len;
-
-    srcoff = move_info[i].get<0>();
-    dstoff = move_info[i].get<1>();
-    len = move_info[i].get<2>();
-
-    r = _do_read(srco, srcoff, len, bl, 0);
-    if (r < 0)
-    goto out;
-
-    r = _do_write(txc, baseo, dstoff, bl.length(), bl, 0);
-    txc->write_onode(baseo);
-    r = 0;
-  }
-
-// After for loop ends, remove src obj
-  r = _do_remove(txc, srco);
-
-  out:
-  return r;
-}
-
-
 int KStore::_rename(TransContext *txc,
 		    CollectionRef& c,
 		    OnodeRef& oldo,
@@ -3298,19 +3273,46 @@ int KStore::_remove_collection(TransContext *txc, coll_t cid,
       r = -ENOENT;
       goto out;
     }
-    pair<ghobject_t,OnodeRef> next;
-    while ((*c)->onode_map.get_next(next.first, &next)) {
-      if (next.second->exists) {
+    size_t nonexistent_count = 0;
+    pair<ghobject_t,OnodeRef> next_onode;
+    while ((*c)->onode_map.get_next(next_onode.first, &next_onode)) {
+      if (next_onode.second->exists) {
 	r = -ENOTEMPTY;
 	goto out;
       }
+      ++nonexistent_count;
     }
-    coll_map.erase(cid);
-    txc->removed_collections.push_back(*c);
-    c->reset();
+    vector<ghobject_t> ls;
+    ghobject_t next;
+    // Enumerate onodes in db, up to nonexistent_count + 1
+    // then check if all of them are marked as non-existent.
+    // Bypass the check if returned number is greater than nonexistent_count
+    r = _collection_list(c->get(), ghobject_t(), ghobject_t::get_max(),
+                         nonexistent_count + 1, &ls, &next);
+    if (r >= 0) {
+      bool exists = false; //ls.size() > nonexistent_count;
+      for (auto it = ls.begin(); !exists && it < ls.end(); ++it) {
+        dout(10) << __func__ << " oid " << *it << dendl;
+        auto onode = (*c)->onode_map.lookup(*it);
+        exists = !onode || onode->exists;
+        if (exists) {
+          dout(10) << __func__ << " " << *it
+                   << " exists in db" << dendl;
+        }
+      }
+      if (!exists) {
+        coll_map.erase(cid);
+        txc->removed_collections.push_back(*c);
+        c->reset();
+        txc->t->rmkey(PREFIX_COLL, stringify(cid));
+        r = 0;
+      } else {
+        dout(10) << __func__ << " " << cid
+                 << " is non-empty" << dendl;
+        r = -ENOTEMPTY;
+      }
+    }
   }
-  txc->t->rmkey(PREFIX_COLL, stringify(cid));
-  r = 0;
 
  out:
   dout(10) << __func__ << " " << cid << " = " << r << dendl;

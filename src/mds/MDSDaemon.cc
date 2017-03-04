@@ -56,6 +56,7 @@
 #include "messages/MCommandReply.h"
 
 #include "auth/AuthAuthorizeHandler.h"
+#include "auth/RotatingKeyRing.h"
 #include "auth/KeyRing.h"
 
 #include "common/config.h"
@@ -63,40 +64,18 @@
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
 
-
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << name << ' '
 
-/**
- * Helper for simple callbacks that call a void fn with no args.
- */
-class C_VoidFn : public Context
-{
-  typedef void (MDSDaemon::*fn_ptr)();
-  protected:
-   MDSDaemon *mds;
-   fn_ptr fn;
-  public:
-  C_VoidFn(MDSDaemon *mds_, fn_ptr fn_)
-    : mds(mds_), fn(fn_)
-  {
-    assert(mds_);
-    assert(fn_);
-  }
-
-  void finish(int r)
-  {
-    (mds->*fn)();
-  }
-};
 
 class MDSDaemon::C_MDS_Tick : public Context {
   protected:
     MDSDaemon *mds_daemon;
 public:
   explicit C_MDS_Tick(MDSDaemon *m) : mds_daemon(m) {}
-  void finish(int r) {
+  void finish(int r) override {
     assert(mds_daemon->mds_lock.is_locked_by_me());
 
     mds_daemon->tick_event = 0;
@@ -155,7 +134,7 @@ class MDSSocketHook : public AdminSocketHook {
 public:
   explicit MDSSocketHook(MDSDaemon *m) : mds(m) {}
   bool call(std::string command, cmdmap_t& cmdmap, std::string format,
-	    bufferlist& out) {
+	    bufferlist& out) override {
     stringstream ss;
     bool r = mds->asok_command(command, cmdmap, format, ss);
     out.append(ss);
@@ -497,10 +476,8 @@ int MDSDaemon::init()
   }
 
   int rotating_auth_attempts = 0;
-  const int max_rotating_auth_attempts = 10;
-
   while (monc->wait_auth_rotating(30.0) < 0) {
-    if (++rotating_auth_attempts <= max_rotating_auth_attempts) {
+    if (++rotating_auth_attempts <= g_conf->max_rotating_auth_attempts) {
       derr << "unable to obtain rotating service keys; retrying" << dendl;
       continue;
     }
@@ -718,7 +695,7 @@ int MDSDaemon::_handle_command(
 
     public:
     explicit SuicideLater(MDSDaemon *mds_) : mds(mds_) {}
-    void finish(int r) {
+    void finish(int r) override {
       // Wait a little to improve chances of caller getting
       // our response before seeing us disappear from mdsmap
       sleep(1);
@@ -735,7 +712,7 @@ int MDSDaemon::_handle_command(
     public:
 
     explicit RespawnLater(MDSDaemon *mds_) : mds(mds_) {}
-    void finish(int r) {
+    void finish(int r) override {
       // Wait a little to improve chances of caller getting
       // our response before seeing us disappear from mdsmap
       sleep(1);
@@ -761,7 +738,7 @@ int MDSDaemon::_handle_command(
       ostringstream secname;
       secname << "cmd" << setfill('0') << std::setw(3) << cmdnum;
       dump_cmddesc_to_json(f, secname.str(), cp->cmdstring, cp->helpstring,
-			   cp->module, cp->perm, cp->availability);
+			   cp->module, cp->perm, cp->availability, 0);
       cmdnum++;
     }
     f->close_section();	// command_descriptions
@@ -800,11 +777,9 @@ int MDSDaemon::_handle_command(
     int64_t session_id = 0;
     bool got = cmd_getval(cct, cmdmap, "session_id", session_id);
     assert(got);
-    const bool killed = mds_rank->kill_session(session_id);
-    if (!killed) {
+    bool killed = mds_rank->kill_session(session_id, false, ss);
+    if (!killed)
       r = -ENOENT;
-      ss << "session '" << session_id << "' not found";
-    }
   } else if (prefix == "heap") {
     if (!ceph_using_tcmalloc()) {
       r = -EOPNOTSUPP;
@@ -1000,8 +975,8 @@ void MDSDaemon::handle_mds_map(MMDSMap *m)
     if (mds_rank == NULL) {
       mds_rank = new MDSRankDispatcher(whoami, mds_lock, clog,
           timer, beacon, mdsmap, messenger, monc,
-          new C_VoidFn(this, &MDSDaemon::respawn),
-          new C_VoidFn(this, &MDSDaemon::suicide));
+          new FunctionContext([this](int r){respawn();}),
+          new FunctionContext([this](int r){suicide();}));
       dout(10) <<  __func__ << ": initializing MDS rank "
                << mds_rank->get_nodeid() << dendl;
       mds_rank->init();
@@ -1143,7 +1118,7 @@ void MDSDaemon::respawn()
 
   // We have to assert out here, because suicide() returns, and callers
   // to respawn expect it never to return.
-  assert(0);
+  ceph_abort();
 }
 
 
@@ -1189,7 +1164,7 @@ bool MDSDaemon::ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bo
       return false;
   }
 
-  *authorizer = monc->auth->build_authorizer(dest_type);
+  *authorizer = monc->build_authorizer(dest_type);
   return *authorizer != NULL;
 }
 
@@ -1328,8 +1303,9 @@ bool MDSDaemon::ms_verify_authorizer(Connection *con, int peer_type,
   EntityName name;
   uint64_t global_id;
 
-  is_valid = authorize_handler->verify_authorizer(cct, monc->rotating_secrets,
-						  authorizer_data, authorizer_reply, name, global_id, caps_info, session_key);
+  is_valid = authorize_handler->verify_authorizer(
+    cct, monc->rotating_secrets.get(),
+    authorizer_data, authorizer_reply, name, global_id, caps_info, session_key);
 
   if (is_valid) {
     entity_name_t n(con->get_peer_type(), global_id);

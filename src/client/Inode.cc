@@ -175,7 +175,7 @@ bool Inode::cap_is_valid(Cap* cap) const
     << "cap expire  " << cap->session->cap_ttl << std::endl
     << "cur time    " << ceph_clock_now(cct) << std::endl;*/
   if ((cap->session->cap_gen <= cap->gen)
-      && (ceph_clock_now(client->cct) < cap->session->cap_ttl)) {
+      && (ceph_clock_now() < cap->session->cap_ttl)) {
     return true;
   }
   return false;
@@ -456,10 +456,10 @@ void Inode::dump(Formatter *f) const
     f->close_section();
   }
   if (!cap_snaps.empty()) {
-    for (map<snapid_t,CapSnap*>::const_iterator p = cap_snaps.begin(); p != cap_snaps.end(); ++p) {
+    for (const auto &p : cap_snaps) {
       f->open_object_section("cap_snap");
-      f->dump_stream("follows") << p->first;
-      p->second->dump(f);
+      f->dump_stream("follows") << p.first;
+      p.second.dump(f);
       f->close_section();
     }
   }

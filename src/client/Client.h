@@ -48,6 +48,7 @@ using std::fstream;
 
 #include "InodeRef.h"
 #include "UserPerm.h"
+#include "include/cephfs/ceph_statx.h"
 
 class FSMap;
 class FSMapUser;
@@ -263,7 +264,7 @@ class Client : public Dispatcher, public md_config_obs_t {
   CommandHook m_command_hook;
 
   // cluster descriptors
-  MDSMap *mdsmap;
+  std::unique_ptr<MDSMap> mdsmap;
 
   SafeTimer timer;
 
@@ -292,14 +293,14 @@ public:
   void tick();
 
   UserPerm pick_my_perms() {
-    uid_t uid = user_id >= 0 ? user_id : ::geteuid();
-    gid_t gid = group_id >= 0 ? group_id : ::getegid();
+    uid_t uid = user_id >= 0 ? user_id : -1;
+    gid_t gid = group_id >= 0 ? group_id : -1;
     return UserPerm(uid, gid);
   }
 
   static UserPerm pick_my_perms(CephContext *c) {
-    uid_t uid = c->_conf->client_mount_uid >= 0 ? c->_conf->client_mount_uid : ::geteuid();
-    gid_t gid = c->_conf->client_mount_gid >= 0 ? c->_conf->client_mount_gid : ::getegid();
+    uid_t uid = c->_conf->client_mount_uid >= 0 ? c->_conf->client_mount_uid : -1;
+    gid_t gid = c->_conf->client_mount_gid >= 0 ? c->_conf->client_mount_gid : -1;
     return UserPerm(uid, gid);
   }
 protected:
@@ -319,8 +320,8 @@ protected:
 
   // FSMap, for when using mds_command
   list<Cond*> waiting_for_fsmap;
-  FSMap *fsmap;
-  FSMapUser *fsmap_user;
+  std::unique_ptr<FSMap> fsmap;
+  std::unique_ptr<FSMapUser> fsmap_user;
 
   // MDS command state
   CommandTable<MDSCommandOp> command_table;
@@ -399,7 +400,7 @@ protected:
 
 public:
   entity_name_t get_myname() { return messenger->get_myname(); } 
-  void sync_write_commit(InodeRef& in);
+  void _sync_write_commit(Inode *in);
 
 protected:
   Filer                 *filer;     
@@ -432,7 +433,7 @@ protected:
 
   // Optional extra metadata about me to send to the MDS
   std::map<std::string, std::string> metadata;
-  void populate_metadata();
+  void populate_metadata(const std::string &mount_root);
 
 
   /* async block write barrier support */
@@ -497,7 +498,6 @@ protected:
   friend class C_Client_DentryInvalidate;  // calls dentry_invalidate_cb
   friend class C_Block_Sync; // Calls block map and protected helpers
   friend class C_C_Tick; // Asserts on client_lock
-  friend class C_Client_SyncCommit; // Asserts on client_lock
   friend class C_Client_RequestInterrupt;
   friend class C_Client_Remount;
   friend void intrusive_ptr_release(Inode *in);
@@ -516,7 +516,7 @@ protected:
   // path traversal for high-level interface
   InodeRef cwd;
   int path_walk(const filepath& fp, InodeRef *end, const UserPerm& perms,
-		bool followsym=true, int mask=0, int uid=-1, int gid=-1);
+		bool followsym=true, int mask=0);
 		
   int fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0);
   int fill_stat(InodeRef& in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0) {
@@ -626,8 +626,8 @@ protected:
   void mark_caps_dirty(Inode *in, int caps);
   int mark_caps_flushing(Inode *in, ceph_tid_t *ptid);
   void adjust_session_flushing_caps(Inode *in, MetaSession *old_s, MetaSession *new_s);
-  void flush_caps();
-  void flush_caps(Inode *in, MetaSession *session);
+  void flush_caps_sync();
+  void flush_caps(Inode *in, MetaSession *session, bool sync=false);
   void kick_flushing_caps(MetaSession *session);
   void early_kick_flushing_caps(MetaSession *session);
   void kick_maxsize_requests(MetaSession *session);
@@ -647,17 +647,22 @@ protected:
   void handle_cap_flushsnap_ack(MetaSession *session, Inode *in, class MClientCaps *m);
   void handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, class MClientCaps *m);
   void cap_delay_requeue(Inode *in);
-  void send_cap(Inode *in, MetaSession *session, Cap *cap,
+  void send_cap(Inode *in, MetaSession *session, Cap *cap, bool sync,
 		int used, int want, int retain, int flush,
 		ceph_tid_t flush_tid);
-  void check_caps(Inode *in, bool is_delayed);
+
+  /* Flags for check_caps() */
+#define CHECK_CAPS_NODELAY	(0x1)
+#define CHECK_CAPS_SYNCHRONOUS	(0x2)
+
+  void check_caps(Inode *in, unsigned flags);
   void get_cap_ref(Inode *in, int cap);
   void put_cap_ref(Inode *in, int cap);
   void flush_snaps(Inode *in, bool all_again=false);
   void wait_sync_caps(Inode *in, ceph_tid_t want);
   void wait_sync_caps(ceph_tid_t want);
   void queue_cap_snap(Inode *in, SnapContext &old_snapc);
-  void finish_cap_snap(Inode *in, CapSnap *capsnap, int used);
+  void finish_cap_snap(Inode *in, CapSnap &capsnap, int used);
   void _flushed_cap_snap(Inode *in, snapid_t seq);
 
   void _schedule_invalidate_dentry_callback(Dentry *dn, bool del);
@@ -719,7 +724,7 @@ private:
   void fill_dirent(struct dirent *de, const char *name, int type, uint64_t ino, loff_t next_off);
 
   // some readdir helpers
-  typedef int (*add_dirent_cb_t)(void *p, struct dirent *de, struct stat *st, int stmask, off_t off);
+  typedef int (*add_dirent_cb_t)(void *p, struct dirent *de, struct ceph_statx *stx, off_t off, Inode *in);
 
   int _opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms);
   void _readdir_drop_dirp_buffer(dir_result_t *dirp);
@@ -727,7 +732,7 @@ private:
   void _readdir_next_frag(dir_result_t *dirp);
   void _readdir_rechoose_frag(dir_result_t *dirp);
   int _readdir_get_frag(dir_result_t *dirp);
-  int _readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p);
+  int _readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p, int caps, bool getref);
   void _closedir(dir_result_t *dirp);
 
   // other helpers
@@ -809,7 +814,6 @@ private:
 	      const char *data_pool, bool *created, const UserPerm &perms);
 
   loff_t _lseek(Fh *fh, loff_t offset, int whence);
-  loff_t _lseek(Fh *fh, loff_t offset, int whence, const UserPerm& perms);
   int _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl);
   int _write(Fh *fh, int64_t offset, uint64_t size, const char *buf,
           const struct iovec *iov, int iovcnt);
@@ -921,7 +925,7 @@ private:
 
   mds_rank_t _get_random_up_mds() const;
 
-  int _ll_getattr(Inode *in, const UserPerm& perms);
+  int _ll_getattr(Inode *in, int caps, const UserPerm& perms);
 
 public:
   int mount(const std::string &mount_root, const UserPerm& perms,
@@ -953,11 +957,13 @@ public:
    * Returns 0 if it reached the end of the directory.
    * If @a cb returns a negative error code, stop and return that.
    */
-  int readdir_r_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p);
+  int readdir_r_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
+		   unsigned want=0, unsigned flags=AT_NO_ATTR_SYNC,
+		   bool getref=false);
 
   struct dirent * readdir(dir_result_t *d);
   int readdir_r(dir_result_t *dirp, struct dirent *de);
-  int readdirplus_r(dir_result_t *dirp, struct dirent *de, struct stat *st, int *stmask);
+  int readdirplus_r(dir_result_t *dirp, struct dirent *de, struct ceph_statx *stx, unsigned want, unsigned flags, Inode **out);
 
   int getdir(const char *relpath, list<string>& names,
 	     const UserPerm& perms);  // get the whole dir at once.
@@ -1008,6 +1014,7 @@ public:
   int setattrx(const char *relpath, struct ceph_statx *stx, int mask,
 	       const UserPerm& perms, int flags=0);
   int fsetattr(int fd, struct stat *attr, int mask, const UserPerm& perms);
+  int fsetattrx(int fd, struct ceph_statx *stx, int mask, const UserPerm& perms);
   int chmod(const char *path, mode_t mode, const UserPerm& perms);
   int fchmod(int fd, mode_t mode, const UserPerm& perms);
   int lchmod(const char *path, mode_t mode, const UserPerm& perms);
@@ -1033,7 +1040,7 @@ public:
   int lookup_parent(Inode *in, const UserPerm& perms, Inode **parent=NULL);
   int lookup_name(Inode *in, Inode *parent, const UserPerm& perms);
   int close(int fd);
-  loff_t lseek(int fd, loff_t offset, int whence, const UserPerm& perms);
+  loff_t lseek(int fd, loff_t offset, int whence);
   int read(int fd, char *buf, loff_t size, loff_t offset=-1);
   int preadv(int fd, const struct iovec *iov, int iovcnt, loff_t offset=-1);
   int write(int fd, const char *buf, loff_t size, loff_t offset=-1);
@@ -1114,6 +1121,9 @@ public:
   Inode *ll_get_inode(vinodeno_t vino);
   int ll_lookup(Inode *parent, const char *name, struct stat *attr,
 		Inode **out, const UserPerm& perms);
+  int ll_lookupx(Inode *parent, const char *name, Inode **out,
+			struct ceph_statx *stx, unsigned want, unsigned flags,
+			const UserPerm& perms);
   bool ll_forget(Inode *in, int count);
   bool ll_put(Inode *in);
   int ll_getattr(Inode *in, struct stat *st, const UserPerm& perms);
@@ -1136,19 +1146,35 @@ public:
   int ll_readlink(Inode *in, char *buf, size_t bufsize, const UserPerm& perms);
   int ll_mknod(Inode *in, const char *name, mode_t mode, dev_t rdev,
 	       struct stat *attr, Inode **out, const UserPerm& perms);
+  int ll_mknodx(Inode *parent, const char *name, mode_t mode, dev_t rdev,
+	        Inode **out, struct ceph_statx *stx, unsigned want,
+		unsigned flags, const UserPerm& perms);
   int ll_mkdir(Inode *in, const char *name, mode_t mode, struct stat *attr,
 	       Inode **out, const UserPerm& perm);
+  int ll_mkdirx(Inode *parent, const char *name, mode_t mode, Inode **out,
+		struct ceph_statx *stx, unsigned want, unsigned flags,
+		const UserPerm& perms);
   int ll_symlink(Inode *in, const char *name, const char *value,
 		 struct stat *attr, Inode **out, const UserPerm& perms);
+  int ll_symlinkx(Inode *parent, const char *name, const char *value,
+		  Inode **out, struct ceph_statx *stx, unsigned want,
+		  unsigned flags, const UserPerm& perms);
   int ll_unlink(Inode *in, const char *name, const UserPerm& perm);
   int ll_rmdir(Inode *in, const char *name, const UserPerm& perms);
   int ll_rename(Inode *parent, const char *name, Inode *newparent,
 		const char *newname, const UserPerm& perm);
   int ll_link(Inode *in, Inode *newparent, const char *newname,
-	      struct stat *attr, const UserPerm& perm);
+	      const UserPerm& perm);
   int ll_open(Inode *in, int flags, Fh **fh, const UserPerm& perms);
+  int _ll_create(Inode *parent, const char *name, mode_t mode,
+	      int flags, InodeRef *in, int caps, Fh **fhp,
+	      const UserPerm& perms);
   int ll_create(Inode *parent, const char *name, mode_t mode, int flags,
 		struct stat *attr, Inode **out, Fh **fhp,
+		const UserPerm& perms);
+  int ll_createx(Inode *parent, const char *name, mode_t mode,
+		int oflags, Inode **outp, Fh **fhp,
+		struct ceph_statx *stx, unsigned want, unsigned lflags,
 		const UserPerm& perms);
   int ll_read_block(Inode *in, uint64_t blockid, char *buf,  uint64_t offset,
 		    uint64_t length, file_layout_t* layout);
@@ -1160,15 +1186,15 @@ public:
   int ll_commit_blocks(Inode *in, uint64_t offset, uint64_t length);
 
   int ll_statfs(Inode *in, struct statvfs *stbuf, const UserPerm& perms);
-  int ll_walk(const char* name, Inode **i, struct stat *attr,
-	      const UserPerm& perms); // XXX in?
+  int ll_walk(const char* name, Inode **i, struct ceph_statx *stx,
+	       unsigned int want, unsigned int flags, const UserPerm& perms);
   uint32_t ll_stripe_unit(Inode *in);
   int ll_file_layout(Inode *in, file_layout_t *layout);
   uint64_t ll_snap_seq(Inode *in);
 
   int ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl);
   int ll_write(Fh *fh, loff_t off, loff_t len, const char *data);
-  loff_t ll_lseek(Fh *fh, loff_t offset, int whence, const UserPerm& perms);
+  loff_t ll_lseek(Fh *fh, loff_t offset, int whence);
   int ll_flush(Fh *fh);
   int ll_fsync(Fh *fh, bool syncdataonly);
   int ll_fallocate(Fh *fh, int mode, loff_t offset, loff_t length);

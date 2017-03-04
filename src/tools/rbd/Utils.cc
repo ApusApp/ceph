@@ -14,6 +14,8 @@
 #include "global/global_context.h"
 #include <iostream>
 #include <boost/regex.hpp>
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
 
 namespace rbd {
 namespace utils {
@@ -208,7 +210,7 @@ int get_special_pool_group_names(const po::variables_map &vm,
     }
   }
 
-  if (group_pool_name->empty()) {
+  if (group_pool_name->empty() && vm.count(pool_key)) {
     *group_pool_name = vm[pool_key].as<std::string>();
   }
 
@@ -257,7 +259,7 @@ int get_special_pool_image_names(const po::variables_map &vm,
     }
   }
 
-  if (image_pool_name->empty()) {
+  if (image_pool_name->empty() && vm.count(pool_key)) {
     *image_pool_name = vm[pool_key].as<std::string>();
   }
 
@@ -446,17 +448,18 @@ int get_pool_journal_names(const po::variables_map &vm,
     }
   }
 
-  if (pool_name->empty()) {
+  if (pool_name != nullptr && pool_name->empty()) {
     *pool_name = at::DEFAULT_POOL_NAME;
   }
 
-  if (journal_name != nullptr && journal_name->empty() && !image_name.empty()) {
+  if (pool_name != nullptr && journal_name != nullptr &&
+      journal_name->empty() && !image_name.empty()) {
     // Try to get journal name from image info.
     librados::Rados rados;
     librados::IoCtx io_ctx;
     librbd::Image image;
-    int r = init_and_open_image(*pool_name, image_name, "", true,
-				  &rados, &io_ctx, &image);
+    int r = init_and_open_image(*pool_name, image_name, "", true, &rados,
+                                &io_ctx, &image);
     if (r < 0) {
       std::cerr << "rbd: failed to open image " << image_name
 		<< " to get journal name: " << cpp_strerror(r) << std::endl;
@@ -540,6 +543,8 @@ int get_image_options(const boost::program_options::variables_map &vm,
   if (vm.count(at::IMAGE_FEATURES)) {
     features = vm[at::IMAGE_FEATURES].as<uint64_t>();
     features_specified = true;
+  } else {
+    features = get_rbd_default_features(g_ceph_context);
   }
 
   if (vm.count(at::IMAGE_STRIPE_UNIT)) {
@@ -868,6 +873,11 @@ std::string timestr(time_t t) {
   strftime(buf, sizeof(buf), "%F %T", &tm);
 
   return buf;
+}
+
+uint64_t get_rbd_default_features(CephContext* cct) {
+  auto features = cct->_conf->get_val<std::string>("rbd_default_features");
+  return boost::lexical_cast<uint64_t>(features);
 }
 
 } // namespace utils

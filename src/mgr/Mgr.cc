@@ -31,6 +31,7 @@
 
 #include "Mgr.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr " << __func__ << " "
@@ -76,7 +77,7 @@ public:
   MetadataUpdate(DaemonStateIndex &daemon_state_, const DaemonKey &key_)
     : daemon_state(daemon_state_), key(key_) {}
 
-  void finish(int r)
+  void finish(int r) override
   {
     daemon_state.clear_updating(key);
     if (r == 0) {
@@ -116,7 +117,7 @@ public:
         }
       } else if (key.first == CEPH_ENTITY_TYPE_OSD) {
       } else {
-        assert(0);
+        ceph_abort();
       }
     } else {
       dout(1) << "mon failed to return metadata for "
@@ -136,7 +137,7 @@ void Mgr::background_init()
 
   finisher.start();
 
-  finisher.queue(new C_StdFunction([this](){
+  finisher.queue(new FunctionContext([this](int r){
     init();
   }));
 }
@@ -148,7 +149,11 @@ void Mgr::init()
   assert(!initialized);
 
   // Start communicating with daemons to learn statistics etc
-  server.init(monc->get_global_id(), client_messenger->get_myaddr());
+  int r = server.init(monc->get_global_id(), client_messenger->get_myaddr());
+  if (r < 0) {
+    derr << "Initialize server fail"<< dendl;
+    return;
+  }
   dout(4) << "Initialized server at " << server.get_myaddr() << dendl;
 
   // Preload all daemon metadata (will subsequently keep this
@@ -338,6 +343,7 @@ void Mgr::shutdown()
 
   // Then stop the finisher to ensure its enqueued contexts aren't going
   // to touch references to the things we're about to tear down
+  finisher.wait_for_empty();
   finisher.stop();
 }
 
@@ -430,7 +436,7 @@ bool Mgr::ms_dispatch(Message *m)
       // from monclient anyway), but we don't see notifications.  Hook
       // into MonClient to get notifications instead of messing
       // with message delivery to achieve it?
-      assert(0);
+      ceph_abort();
 
       py_modules.notify_all("mon_map", "");
       break;

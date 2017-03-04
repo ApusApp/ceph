@@ -17,6 +17,13 @@ install(TARGETS
   DESTINATION bin)
 endif(WITH_TESTS)
 
+add_custom_target(civetweb_h
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+  "${CMAKE_BINARY_DIR}/src/include/civetweb"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  "${CMAKE_SOURCE_DIR}/src/civetweb/include/civetweb.h"
+  "${CMAKE_BINARY_DIR}/src/include/civetweb"
+  COMMENT "keep civetweb.h up-to-date")
 
 set(rgw_a_srcs
   rgw_acl.cc
@@ -29,11 +36,11 @@ set(rgw_a_srcs
   rgw_cache.cc
   rgw_client_io.cc
   rgw_common.cc
+  rgw_compression.cc
   rgw_cors.cc
   rgw_cors_s3.cc
   rgw_dencoder.cc
   rgw_env.cc
-  rgw_fcgi.cc
   rgw_formats.cc
   rgw_frontend.cc
   rgw_gc.cc
@@ -80,10 +87,12 @@ set(rgw_a_srcs
   rgw_rest_opstate.cc
   rgw_rest_realm.cc
   rgw_rest_replica_log.cc
+  rgw_rest_role.cc
   rgw_rest_s3.cc
   rgw_rest_swift.cc
   rgw_rest_usage.cc
   rgw_rest_user.cc
+  rgw_role.cc
   rgw_swift_auth.cc
   rgw_tools.cc
   rgw_usage.cc
@@ -93,28 +102,51 @@ set(rgw_a_srcs
   rgw_xml_enc.cc
   rgw_torrent.cc)
 
+if (WITH_RADOSGW_FCGI_FRONTEND)
+  list(APPEND rgw_a_srcs rgw_fcgi.cc)
+endif()
+
 add_library(rgw_a STATIC ${rgw_a_srcs})
-target_include_directories(rgw_a PUBLIC ${FCGI_INCLUDE_DIR})
+
+add_dependencies(rgw_a civetweb_h)
+
+target_include_directories(rgw_a PUBLIC
+  "../Beast/include"
+  ${FCGI_INCLUDE_DIR})
+
 target_link_libraries(rgw_a librados cls_lock_client cls_rgw_client cls_refcount_client
   cls_log_client cls_statelog_client cls_timeindex_client cls_version_client
-  cls_replica_log_client cls_user_client common common_utf8 global
+  cls_replica_log_client cls_user_client ceph-common common_utf8 global
   ${CURL_LIBRARIES}
   ${EXPAT_LIBRARIES}
   ${OPENLDAP_LIBRARIES} ${CRYPTO_LIBS})
 
 set(radosgw_srcs
-  rgw_fcgi_process.cc
   rgw_loadgen_process.cc
   rgw_civetweb.cc
   rgw_civetweb_frontend.cc
-  rgw_civetweb_log.cc
-  rgw_main.cc)
-add_executable(radosgw ${radosgw_srcs}  $<TARGET_OBJECTS:civetweb_common_objs>)
-target_link_libraries(radosgw rgw_a librados
+  rgw_civetweb_log.cc)
+
+if (WITH_RADOSGW_FCGI_FRONTEND)
+  list(APPEND radosgw_srcs rgw_fcgi_process.cc)
+endif()
+
+if (WITH_RADOSGW_ASIO_FRONTEND)
+  list(APPEND radosgw_srcs
+    rgw_asio_client.cc
+    rgw_asio_frontend.cc)
+endif (WITH_RADOSGW_ASIO_FRONTEND)
+
+add_library(radosgw_a STATIC ${radosgw_srcs}
+  $<TARGET_OBJECTS:civetweb_common_objs>)
+target_link_libraries(radosgw_a rgw_a)
+
+add_executable(radosgw rgw_main.cc)
+target_link_libraries(radosgw radosgw_a librados
   cls_rgw_client cls_lock_client cls_refcount_client
   cls_log_client cls_statelog_client cls_timeindex_client
   cls_version_client cls_replica_log_client cls_user_client
-  global fcgi ${LIB_RESOLV}
+  global ${FCGI_LIBRARY} ${LIB_RESOLV}
   ${CURL_LIBRARIES} ${EXPAT_LIBRARIES} ${SSL_LIBRARIES} ${BLKID_LIBRARIES}
   ${ALLOC_LIBS})
 # radosgw depends on cls libraries at runtime, but not as link dependencies
@@ -131,7 +163,7 @@ target_link_libraries(radosgw-admin rgw_a librados
   cls_rgw_client cls_lock_client cls_refcount_client
   cls_log_client cls_statelog_client cls_timeindex_client
   cls_version_client cls_replica_log_client cls_user_client
-  global fcgi ${LIB_RESOLV}
+  global ${FCGI_LIBRARY} ${LIB_RESOLV}
   ${CURL_LIBRARIES} ${EXPAT_LIBRARIES} ${SSL_LIBRARIES} ${BLKID_LIBRARIES})
 install(TARGETS radosgw-admin DESTINATION bin)
 
@@ -149,7 +181,7 @@ target_link_libraries(radosgw-object-expirer rgw_a librados
   cls_rgw_client cls_lock_client cls_refcount_client
   cls_log_client cls_statelog_client cls_timeindex_client
   cls_version_client cls_replica_log_client cls_user_client
-  global fcgi ${LIB_RESOLV}
+  global ${FCGI_LIBRARY} ${LIB_RESOLV}
   ${CURL_LIBRARIES} ${EXPAT_LIBRARIES})
 install(TARGETS radosgw-object-expirer DESTINATION bin)
 
@@ -176,3 +208,12 @@ target_link_libraries(rgw LINK_PRIVATE
 set_target_properties(rgw PROPERTIES OUTPUT_NAME rgw VERSION 2.0.0
   SOVERSION 2)
 install(TARGETS rgw DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if(WITH_EMBEDDED)
+  include(MergeStaticLibraries)
+  add_library(cephd_rgw_base STATIC rgw_main.cc ${radosgw_admin_srcs})
+  target_include_directories(cephd_rgw_base PUBLIC ${FCGI_INCLUDE_DIR})
+  set_target_properties(cephd_rgw_base PROPERTIES COMPILE_DEFINITIONS BUILDING_FOR_EMBEDDED)
+  merge_static_libraries(cephd_rgw cephd_rgw_base rgw_a radosgw_a)
+  target_link_libraries(cephd_rgw ${FCGI_LIBRARY})
+endif()

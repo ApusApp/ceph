@@ -27,6 +27,7 @@
 #include <string.h>
 #include <string>
 #include <map>
+#include <boost/utility/string_ref.hpp>
 #include "include/types.h"
 #include "include/utime.h"
 #include "rgw_acl.h"
@@ -82,6 +83,7 @@ using ceph::crypto::MD5;
 /* Information whether an object is SLO or not must be exposed to
  * user through custom HTTP header named X-Static-Large-Object. */
 #define RGW_ATTR_SLO_UINDICATOR RGW_ATTR_META_PREFIX "static-large-object"
+#define RGW_ATTR_X_ROBOTS_TAG	RGW_ATTR_PREFIX "x-robots-tag"
 
 #define RGW_ATTR_PG_VER 	RGW_ATTR_PREFIX "pg_ver"
 #define RGW_ATTR_SOURCE_ZONE    RGW_ATTR_PREFIX "source_zone"
@@ -107,13 +109,13 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_OLH_ID_TAG     RGW_ATTR_OLH_PREFIX "idtag"
 #define RGW_ATTR_OLH_PENDING_PREFIX RGW_ATTR_OLH_PREFIX "pending."
 
+#define RGW_ATTR_COMPRESSION    RGW_ATTR_PREFIX "compression"
+
 /* RGW File Attributes */
 #define RGW_ATTR_UNIX_KEY1      RGW_ATTR_PREFIX "unix-key1"
 #define RGW_ATTR_UNIX1          RGW_ATTR_PREFIX "unix1"
 
 #define RGW_BUCKETS_OBJ_SUFFIX ".buckets"
-
-#define RGW_MAX_PENDING_CHUNKS  16
 
 #define RGW_FORMAT_PLAIN        0
 #define RGW_FORMAT_XML          1
@@ -197,6 +199,10 @@ using ceph::crypto::MD5;
 #define ERR_INTERNAL_ERROR       2200
 #define ERR_NOT_IMPLEMENTED      2201
 #define ERR_SERVICE_UNAVAILABLE  2202
+#define ERR_ROLE_EXISTS          2203
+#define ERR_MALFORMED_DOC        2204
+#define ERR_NO_ROLE_FOUND        2205
+#define ERR_DELETE_CONFLICT      2206
 
 #ifndef UINT32_MAX
 #define UINT32_MAX (0xffffffffu)
@@ -344,20 +350,37 @@ class RGWHTTPArgs
       val_map[iter->first] = iter->second;
     }
   }
+  const string& get_str() {
+    return str;
+  }
 };
 
-class RGWConf;
+class RGWEnv;
+
+class RGWConf {
+  friend class RGWEnv;
+protected:
+  void init(CephContext *cct, RGWEnv* env);
+public:
+  RGWConf()
+    : enable_ops_log(1),
+      enable_usage_log(1),
+      defer_to_bucket_acls(0) {
+  }
+
+  int enable_ops_log;
+  int enable_usage_log;
+  uint8_t defer_to_bucket_acls;
+};
 
 class RGWEnv {
   std::map<string, string, ltstr_nocase> env_map;
 public:
-  RGWConf *conf; 
+  RGWConf conf;
 
-  RGWEnv();
-  ~RGWEnv();
   void init(CephContext *cct);
   void init(CephContext *cct, char **envp);
-  void set(const char *name, const char *val);
+  void set(const boost::string_ref& name, const boost::string_ref& val);
   const char *get(const char *name, const char *def_val = NULL);
   int get_int(const char *name, int def_val = 0);
   bool get_bool(const char *name, bool def_val = 0);
@@ -368,19 +391,6 @@ public:
   void remove(const char *name);
 
   std::map<string, string, ltstr_nocase>& get_map() { return env_map; }
-};
-
-class RGWConf {
-  friend class RGWEnv;
-protected:
-  void init(CephContext *cct, RGWEnv * env);
-public:
-  RGWConf() :
-    enable_ops_log(1), enable_usage_log(1), defer_to_bucket_acls(0) {}
-
-  int enable_ops_log;
-  int enable_usage_log;
-  uint8_t defer_to_bucket_acls;
 };
 
 enum http_op {
@@ -436,6 +446,15 @@ enum RGWOpType {
   RGW_OP_GET_CROSS_DOMAIN_POLICY,
   RGW_OP_GET_HEALTH_CHECK,
   RGW_OP_GET_INFO,
+  RGW_OP_CREATE_ROLE,
+  RGW_OP_DELETE_ROLE,
+  RGW_OP_GET_ROLE,
+  RGW_OP_MODIFY_ROLE,
+  RGW_OP_LIST_ROLES,
+  RGW_OP_PUT_ROLE_POLICY,
+  RGW_OP_GET_ROLE_POLICY,
+  RGW_OP_LIST_ROLE_POLICIES,
+  RGW_OP_DELETE_ROLE_POLICY,
 
   /* rgw specific */
   RGW_OP_ADMIN_SET_METADATA
@@ -729,10 +748,15 @@ struct rgw_bucket {
 
   rgw_bucket() { }
   // cppcheck-suppress noExplicitConstructor
-  rgw_bucket(const cls_user_bucket& b) : name(b.name), data_pool(b.data_pool),
-					 data_extra_pool(b.data_extra_pool),
-					 index_pool(b.index_pool), marker(b.marker),
-					 bucket_id(b.bucket_id) {}
+  explicit rgw_bucket(const rgw_user& u, const cls_user_bucket& b)
+    : tenant(u.tenant),
+      name(b.name),
+      data_pool(b.data_pool),
+      data_extra_pool(b.data_extra_pool),
+      index_pool(b.index_pool),
+      marker(b.marker),
+      bucket_id(b.bucket_id) {
+  }
   rgw_bucket(const string& s) : name(s) {
     data_pool = index_pool = s;
     marker = "";
@@ -1114,6 +1138,7 @@ struct RGWStorageStats
   RGWObjCategory category;
   uint64_t size;
   uint64_t size_rounded;
+  uint64_t size_utilized{0}; //< size after compression, encryption
   uint64_t num_objects;
 
   RGWStorageStats()
@@ -1129,7 +1154,11 @@ struct req_state;
 
 class RGWEnv;
 
-class RGWClientIO;
+namespace rgw {
+namespace io {
+class BasicClient;
+}
+}
 
 struct req_info {
   RGWEnv *env;
@@ -1263,7 +1292,7 @@ class RGWRequest;
 /** Store all the state necessary to complete and respond to an HTTP request*/
 struct req_state {
   CephContext *cct;
-  RGWClientIO *cio;
+  rgw::io::BasicClient *cio;
   RGWRequest *req; /// XXX: re-remove??
   http_op op;
   RGWOpType op_type;
@@ -1367,7 +1396,8 @@ struct RGWObjEnt {
   std::string ns;
   rgw_user owner;
   std::string owner_display_name;
-  uint64_t size;
+  uint64_t size{0};
+  uint64_t accounted_size{0};
   ceph::real_time mtime;
   string etag;
   string content_type;
@@ -1375,7 +1405,7 @@ struct RGWObjEnt {
   uint32_t flags;
   uint64_t versioned_epoch;
 
-  RGWObjEnt() : size(0), flags(0), versioned_epoch(0) {}
+  RGWObjEnt() : flags(0), versioned_epoch(0) {}
 
   void dump(Formatter *f) const;
 
@@ -1400,11 +1430,13 @@ struct RGWBucketEnt {
 
   RGWBucketEnt() : size(0), size_rounded(0), count(0) {}
 
-  explicit RGWBucketEnt(const cls_user_bucket_entry& e) : bucket(e.bucket),
-		  					  size(e.size), 
-			  				  size_rounded(e.size_rounded),
-							  creation_time(e.creation_time),
-							  count(e.count) {}
+  explicit RGWBucketEnt(const rgw_user& u, const cls_user_bucket_entry& e)
+    : bucket(u, e.bucket),
+      size(e.size),
+      size_rounded(e.size_rounded),
+      creation_time(e.creation_time),
+      count(e.count) {
+  }
 
   void convert(cls_user_bucket_entry *b) {
     bucket.convert(&b->bucket);
@@ -1960,4 +1992,5 @@ extern string  calc_hash_sha256_close_stream(SHA256 **hash);
 
 extern int rgw_parse_op_type_list(const string& str, uint32_t *perm);
 
+int match(const string& pattern, const string& input, int flag);
 #endif

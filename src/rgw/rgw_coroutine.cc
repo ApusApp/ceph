@@ -14,7 +14,7 @@ class RGWCompletionManager::WaitContext : public Context {
   void *opaque;
 public:
   WaitContext(RGWCompletionManager *_cm, void *_opaque) : manager(_cm), opaque(_opaque) {}
-  void finish(int r) {
+  void finish(int r) override {
     manager->_wakeup(opaque);
   }
 };
@@ -43,7 +43,6 @@ void RGWCompletionManager::register_completion_notifier(RGWAioCompletionNotifier
   Mutex::Locker l(lock);
   if (cn) {
     cns.insert(cn);
-    cn->get();
   }
 }
 
@@ -52,7 +51,6 @@ void RGWCompletionManager::unregister_completion_notifier(RGWAioCompletionNotifi
   Mutex::Locker l(lock);
   if (cn) {
     cns.erase(cn);
-    cn->put();
   }
 }
 
@@ -60,7 +58,6 @@ void RGWCompletionManager::_complete(RGWAioCompletionNotifier *cn, void *user_in
 {
   if (cn) {
     cns.erase(cn);
-    cn->put();
   }
   complete_reqs.push_back(user_info);
   cond.Signal();
@@ -160,7 +157,7 @@ stringstream& RGWCoroutine::Status::set_status()
   if (history.size() > (size_t)max_history) {
     history.pop_front();
   }
-  timestamp = ceph_clock_now(cct);
+  timestamp = ceph_clock_now();
 
   return status;
 }
@@ -316,7 +313,7 @@ bool RGWCoroutinesStack::collect(RGWCoroutine *op, int *ret, RGWCoroutinesStack 
       if (!stack->is_done()) {
         ldout(cct, 20) << "collect(): s=" << (void *)this << " stack=" << (void *)stack << " is still running" << dendl;
       } else if (stack == skip_stack) {
-        ldout(cct, 20) << "collect(): s=" << (void *)this << " stack=" << (void *)stack << " explicitily skipping stack" << dendl;
+        ldout(cct, 20) << "collect(): s=" << (void *)this << " stack=" << (void *)stack << " explicitly skipping stack" << dendl;
       }
       continue;
     }
@@ -373,8 +370,6 @@ bool RGWCoroutinesStack::collect(int *ret, RGWCoroutinesStack *skip_stack) /* re
   return collect(NULL, ret, skip_stack);
 }
 
-static void _aio_completion_notifier_cb(librados::completion_t cb, void *arg);
-
 static void _aio_completion_notifier_cb(librados::completion_t cb, void *arg)
 {
   ((RGWAioCompletionNotifier *)arg)->cb();
@@ -382,7 +377,8 @@ static void _aio_completion_notifier_cb(librados::completion_t cb, void *arg)
 
 RGWAioCompletionNotifier::RGWAioCompletionNotifier(RGWCompletionManager *_mgr, void *_user_data) : completion_mgr(_mgr),
                                                                          user_data(_user_data), lock("RGWAioCompletionNotifier"), registered(true) {
-  c = librados::Rados::aio_create_completion((void *)this, _aio_completion_notifier_cb, NULL);
+  c = librados::Rados::aio_create_completion((void *)this, NULL,
+					     _aio_completion_notifier_cb);
 }
 
 RGWAioCompletionNotifier *RGWCoroutinesStack::create_completion_notifier()
@@ -461,6 +457,7 @@ int RGWCoroutinesManager::run(list<RGWCoroutinesStack *>& stacks)
   int ret = 0;
   int blocked_count = 0;
   int interval_wait_count = 0;
+  bool canceled = false; // set on going_down
   RGWCoroutinesEnv env;
 
   uint64_t run_context = run_context_count.inc();
@@ -572,12 +569,13 @@ int RGWCoroutinesManager::run(list<RGWCoroutinesStack *>& stacks)
       if (going_down.read() > 0) {
 	ldout(cct, 5) << __func__ << "(): was stopped, exiting" << dendl;
 	ret = -ECANCELED;
+        canceled = true;
         break;
       }
       handle_unblocked_stack(context_stacks, scheduled_stacks, blocked_stack, &blocked_count);
       iter = scheduled_stacks.begin();
     }
-    if (ret == -ECANCELED) {
+    if (canceled) {
       break;
     }
 
@@ -587,7 +585,19 @@ int RGWCoroutinesManager::run(list<RGWCoroutinesStack *>& stacks)
   }
 
   lock.get_write();
-  assert(context_stacks.empty() || going_down.read()); // assert on deadlock
+  if (!context_stacks.empty() && !going_down.read()) {
+    JSONFormatter formatter(true);
+    formatter.open_array_section("context_stacks");
+    for (auto& s : context_stacks) {
+      ::encode_json("entry", *s, &formatter);
+    }
+    formatter.close_section();
+    lderr(cct) << __func__ << "(): ERROR: deadlock detected, dumping remaining coroutines:\n";
+    formatter.flush(*_dout);
+    *_dout << dendl;
+    assert(context_stacks.empty() || going_down.read()); // assert on deadlock
+  }
+
   for (auto stack : context_stacks) {
     ldout(cct, 20) << "clearing stack on run() exit: stack=" << (void *)stack << " nref=" << stack->get_nref() << dendl;
     stack->put();

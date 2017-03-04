@@ -14,6 +14,7 @@
 #include "librbd/Utils.h"
 #include "librbd/image/CreateRequest.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
 #define dout_prefix *_dout << "rbd::mirror::image_replayer::CreateImageRequest: " \
@@ -77,7 +78,7 @@ void CreateImageRequest<I>::create_image() {
 
   librbd::image::CreateRequest<I> *req = librbd::image::CreateRequest<I>::create(
     m_local_io_ctx, m_local_image_name, id, m_remote_image_ctx->size,
-    image_options, m_global_image_id, m_remote_mirror_uuid,
+    image_options, m_global_image_id, m_remote_mirror_uuid, false,
     m_remote_image_ctx->op_work_queue, ctx);
   req->send();
 }
@@ -192,7 +193,7 @@ void CreateImageRequest<I>::open_remote_parent_image() {
     &CreateImageRequest<I>::handle_open_remote_parent_image>(this);
   OpenImageRequest<I> *request = OpenImageRequest<I>::create(
     m_remote_parent_io_ctx, &m_remote_parent_image_ctx,
-    m_remote_parent_spec.image_id, true, m_work_queue, ctx);
+    m_remote_parent_spec.image_id, true, ctx);
   request->send();
 }
 
@@ -217,8 +218,8 @@ void CreateImageRequest<I>::open_local_parent_image() {
     CreateImageRequest<I>,
     &CreateImageRequest<I>::handle_open_local_parent_image>(this);
   OpenImageRequest<I> *request = OpenImageRequest<I>::create(
-    m_local_parent_io_ctx, &m_local_parent_image_ctx, m_local_parent_spec.image_id,
-    true, m_work_queue, ctx);
+    m_local_parent_io_ctx, &m_local_parent_image_ctx,
+    m_local_parent_spec.image_id, true, ctx);
   request->send();
 }
 
@@ -319,7 +320,7 @@ void CreateImageRequest<I>::close_local_parent_image() {
     CreateImageRequest<I>,
     &CreateImageRequest<I>::handle_close_local_parent_image>(this);
   CloseImageRequest<I> *request = CloseImageRequest<I>::create(
-    &m_local_parent_image_ctx, m_work_queue, false, ctx);
+    &m_local_parent_image_ctx, ctx);
   request->send();
 }
 
@@ -341,7 +342,7 @@ void CreateImageRequest<I>::close_remote_parent_image() {
     CreateImageRequest<I>,
     &CreateImageRequest<I>::handle_close_remote_parent_image>(this);
   CloseImageRequest<I> *request = CloseImageRequest<I>::create(
-    &m_remote_parent_image_ctx, m_work_queue, false, ctx);
+    &m_remote_parent_image_ctx, ctx);
   request->send();
 }
 

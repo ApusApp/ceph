@@ -21,6 +21,10 @@
 #include "AsyncMessenger.h"
 #include "AsyncConnection.h"
 
+#include "messages/MOSDOp.h"
+#include "messages/MOSDOpReply.h"
+#include "common/EventTrace.h"
+
 // Constant to limit starting sequence number to 2^31.  Nothing special about it, just a big number.  PLR
 #define SEQ_MASK  0x7fffffff 
 
@@ -48,7 +52,7 @@ class C_time_wakeup : public EventCallback {
 
  public:
   explicit C_time_wakeup(AsyncConnectionRef c): conn(c) {}
-  void do_request(int fd_or_id) {
+  void do_request(int fd_or_id) override {
     conn->wakeup_from(fd_or_id);
   }
 };
@@ -58,7 +62,7 @@ class C_handle_read : public EventCallback {
 
  public:
   explicit C_handle_read(AsyncConnectionRef c): conn(c) {}
-  void do_request(int fd_or_id) {
+  void do_request(int fd_or_id) override {
     conn->process();
   }
 };
@@ -68,7 +72,7 @@ class C_handle_write : public EventCallback {
 
  public:
   explicit C_handle_write(AsyncConnectionRef c): conn(c) {}
-  void do_request(int fd) {
+  void do_request(int fd) override {
     conn->handle_write();
   }
 };
@@ -77,7 +81,7 @@ class C_clean_handler : public EventCallback {
   AsyncConnectionRef conn;
  public:
   explicit C_clean_handler(AsyncConnectionRef c): conn(c) {}
-  void do_request(int id) {
+  void do_request(int id) override {
     conn->cleanup();
     delete this;
   }
@@ -88,7 +92,7 @@ class C_tick_wakeup : public EventCallback {
 
  public:
   explicit C_tick_wakeup(AsyncConnectionRef c): conn(c) {}
-  void do_request(int fd_or_id) {
+  void do_request(int fd_or_id) override {
     conn->tick(fd_or_id);
   }
 };
@@ -324,7 +328,10 @@ void AsyncConnection::process()
 {
   ssize_t r = 0;
   int prev_state = state;
-  bool already_dispatch_writer = false;
+#if defined(WITH_LTTNG) && defined(WITH_EVENTTRACE)
+  utime_t ltt_recv_stamp = ceph_clock_now();
+#endif
+  bool need_dispatch_writer = false;
   std::lock_guard<std::mutex> l(lock);
   last_active = ceph::coarse_mono_clock::now();
   do {
@@ -344,7 +351,7 @@ void AsyncConnection::process()
 
           if (tag == CEPH_MSGR_TAG_KEEPALIVE) {
             ldout(async_msgr->cct, 20) << __func__ << " got KEEPALIVE" << dendl;
-	    set_last_keepalive(ceph_clock_now(NULL));
+	    set_last_keepalive(ceph_clock_now());
           } else if (tag == CEPH_MSGR_TAG_KEEPALIVE2) {
             state = STATE_OPEN_KEEPALIVE2;
           } else if (tag == CEPH_MSGR_TAG_KEEPALIVE2_ACK) {
@@ -378,10 +385,11 @@ void AsyncConnection::process()
           t = (ceph_timespec*)state_buffer;
           utime_t kp_t = utime_t(*t);
           write_lock.lock();
-          _send_keepalive_or_ack(true, &kp_t);
+          _append_keepalive_or_ack(true, &kp_t);
 	  write_lock.unlock();
           ldout(async_msgr->cct, 20) << __func__ << " got KEEPALIVE2 " << kp_t << dendl;
-	  set_last_keepalive(ceph_clock_now(NULL));
+	  set_last_keepalive(ceph_clock_now());
+          need_dispatch_writer = true;
           state = STATE_OPEN;
           break;
         }
@@ -424,6 +432,9 @@ void AsyncConnection::process()
 
       case STATE_OPEN_MESSAGE_HEADER:
         {
+#if defined(WITH_LTTNG) && defined(WITH_EVENTTRACE)
+          ltt_recv_stamp = ceph_clock_now();
+#endif
           ldout(async_msgr->cct, 20) << __func__ << " begin MSG" << dendl;
           ceph_msg_header header;
           ceph_msg_header_old oldheader;
@@ -479,7 +490,7 @@ void AsyncConnection::process()
           front.clear();
           middle.clear();
           data.clear();
-          recv_stamp = ceph_clock_now(async_msgr->cct);
+          recv_stamp = ceph_clock_now();
           current_header = header;
           state = STATE_OPEN_MESSAGE_THROTTLE_MESSAGE;
           break;
@@ -547,7 +558,7 @@ void AsyncConnection::process()
             }
           }
 
-          throttle_stamp = ceph_clock_now(msgr->cct);
+          throttle_stamp = ceph_clock_now();
           state = STATE_OPEN_MESSAGE_READ_FRONT;
           break;
         }
@@ -713,7 +724,7 @@ void AsyncConnection::process()
 
           message->set_recv_stamp(recv_stamp);
           message->set_throttle_stamp(throttle_stamp);
-          message->set_recv_complete_stamp(ceph_clock_now(async_msgr->cct));
+          message->set_recv_complete_stamp(ceph_clock_now());
 
           // check received seq#.  if it is old, drop the message.  
           // note that incoming messages may skip ahead.  this is convenient for the client
@@ -739,6 +750,18 @@ void AsyncConnection::process()
 
           message->set_connection(this);
 
+#if defined(WITH_LTTNG) && defined(WITH_EVENTTRACE)
+          if (message->get_type() == CEPH_MSG_OSD_OP || message->get_type() == CEPH_MSG_OSD_OPREPLY) {
+            utime_t ltt_processed_stamp = ceph_clock_now();
+            double usecs_elapsed = (ltt_processed_stamp.to_nsec()-ltt_recv_stamp.to_nsec())/1000;
+            ostringstream buf;
+            if (message->get_type() == CEPH_MSG_OSD_OP)
+              OID_ELAPSED_WITH_MSG(message, usecs_elapsed, "TIME_TO_DECODE_OSD_OP", false);
+            else
+              OID_ELAPSED_WITH_MSG(message, usecs_elapsed, "TIME_TO_DECODE_OSD_OPREPLY", false);
+          }
+#endif
+
           // note last received message.
           in_seq.set(message->get_seq());
 	  ldout(async_msgr->cct, 5) << " rx " << message->get_source() << " seq "
@@ -746,13 +769,7 @@ void AsyncConnection::process()
 				    << " " << *message << dendl;
 
           ack_left.inc();
-          // if send_message always send inline, it may have no
-          // opportunity to send seq ack.
-          if (!already_dispatch_writer) {
-            center->dispatch_event_external(write_handler);
-            already_dispatch_writer = true;
-          }
-
+          need_dispatch_writer = true;
           state = STATE_OPEN;
 
           logger->inc(l_msgr_recv_messages);
@@ -821,6 +838,8 @@ void AsyncConnection::process()
     }
   } while (prev_state != state);
 
+  if (need_dispatch_writer && is_connected())
+    center->dispatch_event_external(write_handler);
   return;
 
  fail:
@@ -864,6 +883,7 @@ ssize_t AsyncConnection::_process_connection()
 
         SocketOptions opts;
         opts.priority = async_msgr->get_socket_priority();
+        opts.connect_bind_addr = msgr->get_myaddr();
         r = worker->connect(get_peer_addr(), opts, &cs);
         if (r < 0)
           goto fail;
@@ -885,7 +905,8 @@ ssize_t AsyncConnection::_process_connection()
           goto fail;
         } else if (r == 0) {
           ldout(async_msgr->cct, 10) << __func__ << " nonblock connect inprogress" << dendl;
-          center->create_file_event(cs.fd(), EVENT_WRITABLE, read_handler);
+          if (async_msgr->get_stack()->nonblock_connect_need_writable_event())
+            center->create_file_event(cs.fd(), EVENT_WRITABLE, read_handler);
           break;
         }
 
@@ -1053,7 +1074,6 @@ ssize_t AsyncConnection::_process_connection()
         }
 
         connect_reply = *((ceph_msg_connect_reply*)state_buffer);
-        connect_reply.features = ceph_sanitize_features(connect_reply.features);
 
         ldout(async_msgr->cct, 20) << __func__ << " connect got reply tag " << (int)connect_reply.tag
                              << " connect_seq " << connect_reply.connect_seq << " global_seq "
@@ -1265,8 +1285,6 @@ ssize_t AsyncConnection::_process_connection()
         }
 
         connect_msg = *((ceph_msg_connect*)state_buffer);
-        // sanitize features
-        connect_msg.features = ceph_sanitize_features(connect_msg.features);
         state = STATE_ACCEPTING_WAIT_CONNECT_MSG_AUTH;
         break;
       }
@@ -1350,7 +1368,7 @@ ssize_t AsyncConnection::_process_connection()
     default:
       {
         lderr(async_msgr->cct) << __func__ << " bad state: " << state << dendl;
-        assert(0);
+        ceph_abort();
       }
   }
 
@@ -1626,7 +1644,7 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
     existing = NULL;
     goto open;
   }
-  assert(0);
+  ceph_abort();
 
  replace:
   ldout(async_msgr->cct, 10) << __func__ << " accept replacing " << existing << dendl;
@@ -1694,10 +1712,13 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
           if (existing->delay_state)
             existing->delay_state->set_center(new_center);
         } else if (existing->state == STATE_CLOSED) {
-          cs.close();
+          auto back_to_close = std::bind(
+            [](ConnectedSocket &cs) mutable { cs.close(); }, std::move(cs));
+          new_center->submit_to(
+              new_center->get_id(), std::move(back_to_close), true);
           return ;
         } else {
-          assert(0);
+          ceph_abort();
         }
       }
 
@@ -1840,7 +1861,7 @@ void AsyncConnection::_connect()
 void AsyncConnection::accept(ConnectedSocket socket, entity_addr_t &addr)
 {
   ldout(async_msgr->cct, 10) << __func__ << " sd=" << socket.fd() << dendl;
-  assert(socket.fd() > 0);
+  assert(socket.fd() >= 0);
 
   std::lock_guard<std::mutex> l(lock);
   cs = std::move(socket);
@@ -1852,6 +1873,7 @@ void AsyncConnection::accept(ConnectedSocket socket, entity_addr_t &addr)
 
 int AsyncConnection::send_message(Message *m)
 {
+  FUNCTRACE();
   lgeneric_subdout(async_msgr->cct, ms,
 		   1) << "-- " << async_msgr->get_myaddr() << " --> "
 		      << get_peer_addr() << " -- "
@@ -1865,6 +1887,11 @@ int AsyncConnection::send_message(Message *m)
 
   m->get_header().src = async_msgr->get_myname();
   m->set_connection(this);
+
+  if (m->get_type() == CEPH_MSG_OSD_OP)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OP_BEGIN", true);
+  else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OPREPLY_BEGIN", true);
 
   if (async_msgr->get_myaddr() == get_peer_addr()) { //loopback connection
     ldout(async_msgr->cct, 20) << __func__ << " " << *m << " local" << dendl;
@@ -2149,6 +2176,7 @@ void AsyncConnection::prepare_send_message(uint64_t features, Message *m, buffer
 
 ssize_t AsyncConnection::write_message(Message *m, bufferlist& bl, bool more)
 {
+  FUNCTRACE();
   assert(can_write == WriteStatus::CANWRITE);
   m->set_seq(out_seq.inc());
 
@@ -2244,6 +2272,10 @@ ssize_t AsyncConnection::write_message(Message *m, bufferlist& bl, bool more)
   } else {
     ldout(async_msgr->cct, 10) << __func__ << " sending " << m << " continuely." << dendl;
   }
+  if (m->get_type() == CEPH_MSG_OSD_OP)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OP_END", false);
+  else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OPREPLY_END", false);
   m->put();
 
   return rc;
@@ -2316,7 +2348,7 @@ void AsyncConnection::DelayedDelivery::do_request(int id)
     utime_t release = delay_queue.front().first;
     m = delay_queue.front().second;
     string delay_msg_type = msgr->cct->_conf->ms_inject_delay_msg_type;
-    utime_t now = ceph_clock_now(msgr->cct);
+    utime_t now = ceph_clock_now();
     if ((release > now &&
         (delay_msg_type.empty() || m->get_type_name() == delay_msg_type))) {
       utime_t t = release - now;
@@ -2369,8 +2401,9 @@ void AsyncConnection::mark_down()
   _stop();
 }
 
-void AsyncConnection::_send_keepalive_or_ack(bool ack, utime_t *tp)
+void AsyncConnection::_append_keepalive_or_ack(bool ack, utime_t *tp)
 {
+  ldout(async_msgr->cct, 10) << __func__ << dendl;
   if (ack) {
     assert(tp);
     struct ceph_timespec ts;
@@ -2379,15 +2412,13 @@ void AsyncConnection::_send_keepalive_or_ack(bool ack, utime_t *tp)
     outcoming_bl.append((char*)&ts, sizeof(ts));
   } else if (has_feature(CEPH_FEATURE_MSGR_KEEPALIVE2)) {
     struct ceph_timespec ts;
-    utime_t t = ceph_clock_now(async_msgr->cct);
+    utime_t t = ceph_clock_now();
     t.encode_timeval(&ts);
     outcoming_bl.append(CEPH_MSGR_TAG_KEEPALIVE2);
     outcoming_bl.append((char*)&ts, sizeof(ts));
   } else {
     outcoming_bl.append(CEPH_MSGR_TAG_KEEPALIVE);
   }
-
-  ldout(async_msgr->cct, 10) << __func__ << " try send keepalive or ack" << dendl;
 }
 
 void AsyncConnection::handle_write()
@@ -2398,7 +2429,7 @@ void AsyncConnection::handle_write()
   write_lock.lock();
   if (can_write == WriteStatus::CANWRITE) {
     if (keepalive) {
-      _send_keepalive_or_ack();
+      _append_keepalive_or_ack();
       keepalive = false;
     }
 

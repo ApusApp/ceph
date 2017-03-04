@@ -13,12 +13,15 @@
 
 #include "DaemonServer.h"
 
+#include "auth/RotatingKeyRing.h"
+
 #include "messages/MMgrOpen.h"
 #include "messages/MMgrConfigure.h"
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
 #include "messages/MPGStats.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mgr
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr.server " << __func__ << " "
@@ -45,11 +48,14 @@ DaemonServer::~DaemonServer() {
 int DaemonServer::init(uint64_t gid, entity_addr_t client_addr)
 {
   // Initialize Messenger
-  msgr = Messenger::create(g_ceph_context, g_conf->ms_type,
+  std::string public_msgr_type = g_conf->ms_public_type.empty() ? g_conf->ms_type : g_conf->ms_public_type;
+  msgr = Messenger::create(g_ceph_context, public_msgr_type,
 			   entity_name_t::MGR(gid), "server", getpid(), 0);
   int r = msgr->bind(g_conf->public_addr);
-  if (r < 0)
+  if (r < 0) {
+    derr << "unable to bind mgr to " << g_conf->public_addr << dendl;
     return r;
+  }
 
   msgr->set_myname(entity_name_t::MGR(gid));
   msgr->set_addr_unknowns(client_addr);
@@ -77,7 +83,7 @@ bool DaemonServer::ms_verify_authorizer(Connection *con,
   auto handler = auth_registry.get_handler(protocol);
   if (!handler) {
     dout(0) << "No AuthAuthorizeHandler found for protocol " << protocol << dendl;
-    assert(0);
+    ceph_abort();
     is_valid = false;
     return true;
   }
@@ -86,11 +92,12 @@ bool DaemonServer::ms_verify_authorizer(Connection *con,
   EntityName name;
   uint64_t global_id = 0;
 
-  is_valid = handler->verify_authorizer(cct, monc->rotating_secrets,
-						  authorizer_data,
-                                                  authorizer_reply, name,
-                                                  global_id, caps_info,
-                                                  session_key);
+  is_valid = handler->verify_authorizer(
+    cct, monc->rotating_secrets.get(),
+    authorizer_data,
+    authorizer_reply, name,
+    global_id, caps_info,
+    session_key);
 
   // TODO: invent some caps suitable for ceph-mgr
 
@@ -112,7 +119,7 @@ bool DaemonServer::ms_get_authorizer(int dest_type,
       return false;
   }
 
-  *authorizer = monc->auth->build_authorizer(dest_type);
+  *authorizer = monc->build_authorizer(dest_type);
   dout(20) << "got authorizer " << *authorizer << dendl;
   return *authorizer != NULL;
 }
@@ -162,7 +169,7 @@ bool DaemonServer::handle_open(MMgrOpen *m)
           << m->daemon_name << dendl;
 
   auto configure = new MMgrConfigure();
-  configure->stats_period = 5;
+  configure->stats_period = g_conf->mgr_stats_period;
   m->get_connection()->send_message(configure);
 
   if (daemon_state.exists(key)) {
@@ -263,7 +270,7 @@ bool DaemonServer::handle_command(MCommand *m)
       dout(20) << "Dumping " << pyc.cmdstring << " (" << pyc.helpstring
                << ")" << dendl;
       dump_cmddesc_to_json(&f, secname.str(), pyc.cmdstring, pyc.helpstring,
-			   "mgr", pyc.perm, "cli");
+			   "mgr", pyc.perm, "cli", 0);
       cmdnum++;
     }
 #if 0
@@ -273,7 +280,7 @@ bool DaemonServer::handle_command(MCommand *m)
       ostringstream secname;
       secname << "cmd" << setfill('0') << std::setw(3) << cmdnum;
       dump_cmddesc_to_json(f, secname.str(), cp->cmdstring, cp->helpstring,
-			   cp->module, cp->perm, cp->availability);
+			   cp->module, cp->perm, cp->availability, 0);
       cmdnum++;
     }
 #endif

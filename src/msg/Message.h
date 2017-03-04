@@ -85,7 +85,7 @@
 #define MSG_REMOVE_SNAPS       90
 
 #define MSG_OSD_SCRUB          91
-#define MSG_OSD_PG_MISSING     92
+//#define MSG_OSD_PG_MISSING     92  // obsolete
 #define MSG_OSD_REP_SCRUB      93
 
 #define MSG_OSD_PG_SCAN        94
@@ -329,8 +329,9 @@ public:
    */
 
   void clear_payload() {
-    if (byte_throttler)
+    if (byte_throttler) {
       byte_throttler->put(payload.length() + middle.length());
+    }
     payload.clear();
     middle.clear();
   }
@@ -360,10 +361,10 @@ public:
 
   void set_middle(bufferlist& bl) {
     if (byte_throttler)
-      byte_throttler->put(payload.length());
+      byte_throttler->put(middle.length());
     middle.claim(bl, buffer::list::CLAIM_ALLOW_NONSHAREABLE);
     if (byte_throttler)
-      byte_throttler->take(payload.length());
+      byte_throttler->take(middle.length());
   }
   bufferlist& get_middle() { return middle; }
 
@@ -375,6 +376,7 @@ public:
       byte_throttler->take(data.length());
   }
 
+  const bufferlist& get_data() const { return data; }
   bufferlist& get_data() { return data; }
   void claim_data(bufferlist& bl,
 		  unsigned int flags = buffer::list::CLAIM_DEFAULT) {

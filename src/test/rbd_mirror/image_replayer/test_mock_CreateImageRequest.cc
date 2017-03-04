@@ -40,9 +40,13 @@ struct CreateRequest<librbd::MockTestImageCtx> {
                                const librbd::ImageOptions &image_options,
                                const std::string &non_primary_global_image_id,
                                const std::string &primary_mirror_uuid,
+                               bool skip_mirror_enable,
                                MockContextWQ *op_work_queue,
                                Context *on_finish) {
     assert(s_instance != nullptr);
+    EXPECT_FALSE(non_primary_global_image_id.empty());
+    EXPECT_FALSE(primary_mirror_uuid.empty());
+    EXPECT_FALSE(skip_mirror_enable);
     s_instance->on_finish = on_finish;
     s_instance->construct(ioctx);
     return s_instance;
@@ -114,7 +118,6 @@ struct CloseImageRequest<librbd::MockTestImageCtx> {
   Context *on_finish = nullptr;
 
   static CloseImageRequest* create(librbd::MockTestImageCtx **image_ctx,
-                                   ContextWQ *work_queue, bool destroy_only,
                                    Context *on_finish) {
     assert(s_instance != nullptr);
     s_instance->construct(*image_ctx);
@@ -143,8 +146,7 @@ struct OpenImageRequest<librbd::MockTestImageCtx> {
   static OpenImageRequest* create(librados::IoCtx &io_ctx,
                                   librbd::MockTestImageCtx **image_ctx,
                                   const std::string &image_id,
-                                  bool read_only, ContextWQ *work_queue,
-                                  Context *on_finish) {
+                                  bool read_only, Context *on_finish) {
     assert(s_instance != nullptr);
     s_instance->image_ctx = image_ctx;
     s_instance->on_finish = on_finish;
@@ -201,7 +203,7 @@ public:
   typedef OpenImageRequest<librbd::MockTestImageCtx> MockOpenImageRequest;
   typedef CloseImageRequest<librbd::MockTestImageCtx> MockCloseImageRequest;
 
-  virtual void SetUp() {
+  void SetUp() override {
     TestMockFixture::SetUp();
 
     librbd::RBD rbd;
@@ -215,8 +217,9 @@ public:
       librbd::ImageCtx *ictx = new librbd::ImageCtx(parent_image_ctx->name,
 						    "", "", m_remote_io_ctx,
                                                     false);
-      ictx->state->open();
-      EXPECT_EQ(0, ictx->operations->snap_create(snap_name.c_str()));
+      ictx->state->open(false);
+      EXPECT_EQ(0, ictx->operations->snap_create(snap_name.c_str(),
+						 cls::rbd::UserSnapshotNamespace()));
       EXPECT_EQ(0, ictx->operations->snap_protect(snap_name.c_str()));
       ictx->state->close();
     }

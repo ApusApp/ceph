@@ -1,17 +1,12 @@
 add_library(rbd_types STATIC
   journal/Types.cc
-  mirroring_watcher/Types.cc 
+  mirroring_watcher/Types.cc
   WatchNotifyTypes.cc)
 
 set(librbd_internal_srcs
-  AioCompletion.cc
-  AioImageRequest.cc
-  AioImageRequestWQ.cc
-  AioObjectRequest.cc
   AsyncObjectThrottle.cc
   AsyncOperation.cc
   AsyncRequest.cc
-  CopyupRequest.cc
   DiffIterate.cc
   ExclusiveLock.cc
   Group.cc
@@ -22,31 +17,47 @@ set(librbd_internal_srcs
   Journal.cc
   LibrbdAdminSocketHook.cc
   LibrbdWriteback.cc
-  MirroringWatcher.cc 
+  ManagedLock.cc
+  MirroringWatcher.cc
   ObjectMap.cc
-  ObjectWatcher.cc 
   Operations.cc
   Utils.cc
   cache/ImageWriteback.cc
   cache/PassthroughImageCache.cc
-  exclusive_lock/AcquireRequest.cc
+  Watcher.cc
   exclusive_lock/AutomaticPolicy.cc
-  exclusive_lock/ReacquireRequest.cc
-  exclusive_lock/ReleaseRequest.cc
+  exclusive_lock/PreAcquireRequest.cc
+  exclusive_lock/PostAcquireRequest.cc
+  exclusive_lock/PreReleaseRequest.cc
   exclusive_lock/StandardPolicy.cc
   image/CloseRequest.cc
   image/CreateRequest.cc
   image/OpenRequest.cc
   image/RefreshParentRequest.cc
   image/RefreshRequest.cc
+  image/RemoveRequest.cc
   image/SetFlagsRequest.cc
   image/SetSnapRequest.cc
   image_watcher/NotifyLockOwner.cc
-  image_watcher/RewatchRequest.cc
+  io/AioCompletion.cc
+  io/CopyupRequest.cc
+  io/ImageRequest.cc
+  io/ImageRequestWQ.cc
+  io/ObjectRequest.cc
+  io/ReadResult.cc
   journal/RemoveRequest.cc
   journal/CreateRequest.cc
+  journal/OpenRequest.cc
+  journal/PromoteRequest.cc
   journal/Replay.cc
   journal/StandardPolicy.cc
+  journal/Utils.cc
+  managed_lock/AcquireRequest.cc
+  managed_lock/BreakRequest.cc
+  managed_lock/GetLockerRequest.cc
+  managed_lock/ReacquireRequest.cc
+  managed_lock/ReleaseRequest.cc
+  managed_lock/Utils.cc
   mirror/DisableRequest.cc
   mirror/EnableRequest.cc
   object_map/CreateRequest.cc
@@ -61,7 +72,7 @@ set(librbd_internal_srcs
   object_map/SnapshotRollbackRequest.cc
   object_map/UnlockRequest.cc
   object_map/UpdateRequest.cc
-  object_watcher/Notifier.cc
+  watcher/Notifier.cc
   operation/DisableFeaturesRequest.cc
   operation/EnableFeaturesRequest.cc
   operation/FlattenRequest.cc
@@ -79,49 +90,50 @@ set(librbd_internal_srcs
   operation/SnapshotRollbackRequest.cc
   operation/SnapshotUnprotectRequest.cc
   operation/SnapshotLimitRequest.cc
-  operation/TrimRequest.cc)
+  operation/TrimRequest.cc
+  watcher/RewatchRequest.cc
+  watcher/Types.cc
+  ${CMAKE_SOURCE_DIR}/src/common/ContextCompletion.cc)
 
 add_library(rbd_api STATIC librbd.cc)
 add_library(rbd_internal STATIC
   ${librbd_internal_srcs}
   $<TARGET_OBJECTS:rados_snap_set_diff_obj>)
 if(WITH_LTTNG)
-  add_dependencies(rbd_api librbd-tp)
+  add_dependencies(rbd_internal librbd-tp)
 endif()
 
 add_library(librbd ${CEPH_SHARED}
-  $<TARGET_OBJECTS:osdc_rbd_objs>
-  $<TARGET_OBJECTS:common_util_obj>
-  ${CMAKE_SOURCE_DIR}/src/common/ContextCompletion.cc
   librbd.cc)
-if(LINUX)
-  list(APPEND librbd 
-    $<TARGET_OBJECTS:parse_secret_objs>  
-    $<TARGET_OBJECTS:krbd_objs>
-    )
-endif(LINUX)
 
 target_link_libraries(librbd LINK_PRIVATE 
   rbd_internal
   rbd_types
   journal
   librados 
-  common 
   osdc
   cls_rbd_client 
   cls_lock_client 
   cls_journal_client 
+  ceph-common
   pthread
-  udev
-  keyutils
   ${CMAKE_DL_LIBS}
   ${EXTRALIBS})
+if(HAVE_UDEV)
+  target_link_libraries(librbd LINK_PRIVATE
+    udev)
+endif()
 if(ENABLE_SHARED)
   set_target_properties(librbd PROPERTIES
     OUTPUT_NAME rbd
-    VERSION 1.0.0
+    VERSION 1.12.0
     SOVERSION 1
     COMPILE_FLAGS "-fvisibility=hidden -fvisibility-inlines-hidden"
     LINK_FLAGS "-Wl,--exclude-libs,ALL")
 endif(ENABLE_SHARED)
 install(TARGETS librbd DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if(WITH_EMBEDDED)
+  add_library(cephd_rbd_base STATIC librbd.cc ${CMAKE_SOURCE_DIR}/src/common/ContextCompletion.cc)
+  merge_static_libraries(cephd_rbd cephd_rbd_base rbd_internal rbd_types journal)
+endif()

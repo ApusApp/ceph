@@ -34,7 +34,7 @@ elif [ -n "$CEPH_ROOT" ]; then
         [ -z "$PYBIND" ] && PYBIND=$CEPH_ROOT/src/pybind
         [ -z "$CEPH_BIN" ] && CEPH_BIN=$CEPH_BUILD_DIR/bin
         [ -z "$CEPH_ADM" ] && CEPH_ADM=$CEPH_BIN/ceph
-        [ -z "$INIT_CEPH" ] && INIT_CEPH=$CEPH_BIN/init-ceph
+        [ -z "$INIT_CEPH" ] && INIT_CEPH=$CEPH_BUILD_DIR/bin/init-ceph
         [ -z "$CEPH_LIB" ] && CEPH_LIB=$CEPH_BUILD_DIR/lib
         [ -z "$OBJCLASS_PATH" ] && OBJCLASS_PATH=$CEPH_LIB
         [ -z "$EC_PATH" ] && EC_PATH=$CEPH_LIB
@@ -60,10 +60,10 @@ export DYLD_LIBRARY_PATH=$CEPH_LIB:$DYLD_LIBRARY_PATH
 [ -z "$CEPH_NUM_MON" ] && CEPH_NUM_MON=3
 [ -z "$CEPH_NUM_OSD" ] && CEPH_NUM_OSD=3
 [ -z "$CEPH_NUM_MDS" ] && CEPH_NUM_MDS=3
-[ -z "$CEPH_NUM_MGR" ] && CEPH_NUM_MGR=0
+[ -z "$CEPH_NUM_MGR" ] && CEPH_NUM_MGR=1
 [ -z "$CEPH_NUM_FS"  ] && CEPH_NUM_FS=1
 [ -z "$CEPH_MAX_MDS" ] && CEPH_MAX_MDS=1
-[ -z "$CEPH_NUM_RGW" ] && CEPH_NUM_RGW=1
+[ -z "$CEPH_NUM_RGW" ] && CEPH_NUM_RGW=0
 
 [ -z "$CEPH_DIR" ] && CEPH_DIR="$PWD"
 [ -z "$CEPH_DEV_DIR" ] && CEPH_DEV_DIR="$CEPH_DIR/dev"
@@ -71,15 +71,20 @@ export DYLD_LIBRARY_PATH=$CEPH_LIB:$DYLD_LIBRARY_PATH
 [ -z "$CEPH_RGW_PORT" ] && CEPH_RGW_PORT=8000
 [ -z "$CEPH_CONF_PATH" ] && CEPH_CONF_PATH=$CEPH_DIR
 
+if [ $CEPH_NUM_OSD -gt 3 ]; then
+    OSD_POOL_DEFAULT_SIZE=3
+else
+    OSD_POOL_DEFAULT_SIZE=$CEPH_NUM_OSD
+fi
+
 extra_conf=""
-new=0
+new=1
 standby=0
 debug=0
 start_all=1
 start_mon=0
 start_mds=0
 start_osd=0
-start_rgw=0
 ip=""
 nodaemon=0
 smallmds=0
@@ -91,6 +96,7 @@ cephx=1 #turn cephx on by default
 cache=""
 memstore=0
 bluestore=0
+rgw_frontend="civetweb"
 lockdep=${LOCKDEP:-1}
 
 VSTART_SEC="client.vstart.sh"
@@ -108,8 +114,8 @@ usage=$usage"\t-d, --debug\n"
 usage=$usage"\t-s, --standby_mds: Generate standby-replay MDS for each active\n"
 usage=$usage"\t-l, --localhost: use localhost instead of hostname\n"
 usage=$usage"\t-i <ip>: bind to specific ip\n"
-usage=$usage"\t-r start radosgw (needs ceph compiled with --radosgw)\n"
-usage=$usage"\t-n, --new\n"
+usage=$usage"\t-n, --new (default)\n"
+usage=$usage"\t-N, --not-new: reuse existing cluster config\n"
 usage=$usage"\t--valgrind[_{osd,mds,mon,rgw}] 'toolname args...'\n"
 usage=$usage"\t--nodaemon: use ceph-run as wrapper for mon/osd/mds\n"
 usage=$usage"\t--smallmds: limit mds cache size\n"
@@ -124,6 +130,7 @@ usage=$usage"\t--mon_num specify ceph monitor count\n"
 usage=$usage"\t--osd_num specify ceph osd count\n"
 usage=$usage"\t--mds_num specify ceph mds count\n"
 usage=$usage"\t--rgw_port specify ceph rgw http listen port\n"
+usage=$usage"\t--rgw_frontend specify the rgw frontend configuration\n"
 usage=$usage"\t-b, --bluestore use bluestore as the osd objectstore backend\n"
 usage=$usage"\t--memstore use memstore as the osd objectstore backend\n"
 usage=$usage"\t--cache <pool>: enable cache tiering on pool\n"
@@ -152,15 +159,15 @@ case $1 in
 	    ip="$2"
 	    shift
 	    ;;
-    -r )
-	    start_rgw=1
-	    ;;
     -e )
 	    ec=1
 	    ;;
     --new | -n )
 	    new=1
 	    ;;
+    --not-new | -N )
+	new=0
+	;;
     --short )
 	    short=1
 	    ;;
@@ -210,6 +217,10 @@ case $1 in
             ;;
     --rgw_port )
             CEPH_RGW_PORT=$2
+            shift
+            ;;
+    --rgw_frontend )
+            rgw_frontend=$2
             shift
             ;;
     mon )
@@ -278,6 +289,10 @@ case $1 in
 esac
 shift
 done
+
+if [ "$start_all" -eq 1 ]; then
+    $SUDO $INIT_CEPH stop
+fi
 
 if [ "$overwrite_conf" -eq 0 ]; then
     MON=`$CEPH_BIN/ceph-conf -c $conf_fn --name $VSTART_SEC num_mon 2>/dev/null` && \
@@ -411,9 +426,6 @@ fi
 # sudo if btrfs
 test -d $CEPH_DEV_DIR/osd0/. && test -e $CEPH_DEV_DIR/sudo && SUDO="sudo"
 
-if [ "$start_all" -eq 1 ]; then
-    $SUDO $INIT_CEPH stop
-fi
 prun $SUDO rm -f core*
 
 test -d $CEPH_OUT_DIR || mkdir $CEPH_OUT_DIR
@@ -492,6 +504,7 @@ if [ "$start_mon" -eq 1 ]; then
         fsid = $(uuidgen)
         osd pg bits = 3
         osd pgp bits = 5  ; (invalid, but ceph should cope!)
+        osd pool default size = $OSD_POOL_DEFAULT_SIZE
         osd crush chooseleaf type = 0
         osd pool default min size = 1
         osd failsafe full ratio = .99
@@ -502,7 +515,7 @@ if [ "$start_mon" -eq 1 ]; then
         erasure code dir = $EC_PATH
         plugin dir = $CEPH_LIB
         osd pool default erasure code profile = plugin=jerasure technique=reed_sol_van k=2 m=1 ruleset-failure-domain=osd
-        rgw frontends = fastcgi, civetweb port=$CEPH_RGW_PORT
+        rgw frontends = $rgw_frontend port=$CEPH_RGW_PORT
         rgw dns name = localhost
         filestore fd cache size = 32
         run dir = $CEPH_OUT_DIR
@@ -515,7 +528,9 @@ EOF
 		fi
 		if [ "$cephx" -eq 1 ] ; then
 			wconf <<EOF
-        auth supported = cephx
+        auth cluster required = cephx
+        auth service required = cephx
+        auth client required = cephx
 EOF
 		else
 			wconf <<EOF
@@ -563,12 +578,14 @@ $DAEMONOPTS
         osd class default list = *
         osd scrub load threshold = 2000.0
         osd debug op order = true
+        osd debug misdirected ops = true
         filestore wbthrottle xfs ios start flusher = 10
         filestore wbthrottle xfs ios hard limit = 20
         filestore wbthrottle xfs inodes hard limit = 30
         filestore wbthrottle btrfs ios start flusher = 10
         filestore wbthrottle btrfs ios hard limit = 20
         filestore wbthrottle btrfs inodes hard limit = 30
+        osd copyfrom max chunk = 524288
 	bluestore fsck on mount = true
 	bluestore block create = true
 	bluestore block db size = 67108864
@@ -585,6 +602,7 @@ $extra_conf
         mon reweight min pgs per osd = 4
         mon osd prime pg temp = true
         crushtool = $CEPH_BIN/crushtool
+        mon allow pool delete = true
 $DAEMONOPTS
 $CMONDEBUG
 $extra_conf
@@ -654,7 +672,9 @@ if [ "$start_osd" -eq 1 ]; then
 EOF
 
 	    rm -rf $CEPH_DEV_DIR/osd$osd || true
-	    for f in $CEPH_DEV_DIR/osd$osd/*; do btrfs sub delete $f &> /dev/null || true; done
+            if command -v btrfs > /dev/null; then
+	        for f in $CEPH_DEV_DIR/osd$osd/*; do btrfs sub delete $f &> /dev/null || true; done
+            fi
 	    mkdir -p $CEPH_DEV_DIR/osd$osd
 
 	    uuid=`uuidgen`
@@ -682,23 +702,21 @@ EOF
 fi
 
 if [ "$start_mds" -eq 1 -a "$CEPH_NUM_MDS" -gt 0 ]; then
-    if [ "$CEPH_NUM_FS" -gt "1" ] ; then
-        ceph_adm fs flag set enable_multiple true --yes-i-really-mean-it
-    fi
-
-    fs=0
-    for name in a b c d e f g h i j k l m n o p
-    do
-        ceph_adm osd pool create "cephfs_data_${name}" 8
-        ceph_adm osd pool create "cephfs_metadata_${name}" 8
-        ceph_adm fs new "cephfs_${name}" "cephfs_metadata_${name}" "cephfs_data_${name}"
-        if [ "$CEPH_MAX_MDS" -gt 1 ]; then
-            ceph_adm fs set "cephfs_${name}" allow_multimds true --yes-i-really-mean-it
-            ceph_adm fs set "cephfs_${name}" max_mds "$CEPH_MAX_MDS"
+    if [ "$CEPH_NUM_FS" -gt "0" ] ; then
+        if [ "$CEPH_NUM_FS" -gt "1" ] ; then
+            ceph_adm fs flag set enable_multiple true --yes-i-really-mean-it
         fi
-        fs=$(($fs + 1))
-        [ $fs -eq $CEPH_NUM_FS ] && break
-    done
+
+        fs=0
+        for name in a b c d e f g h i j k l m n o p
+        do
+            ceph_adm osd pool create "cephfs_data_${name}" 8
+            ceph_adm osd pool create "cephfs_metadata_${name}" 8
+            ceph_adm fs new "cephfs_${name}" "cephfs_metadata_${name}" "cephfs_data_${name}"
+            fs=$(($fs + 1))
+            [ $fs -eq $CEPH_NUM_FS ] && break
+        done
+    fi
 
     mds=0
     for name in a b c d e f g h i j k l m n o p
@@ -744,6 +762,22 @@ EOF
     done
 fi
 
+# Don't set max_mds until all the daemons are started, otherwise
+# the intended standbys might end up in active roles.
+if [ "$CEPH_MAX_MDS" -gt 1 ]; then
+    sleep 5  # wait for daemons to make it into FSMap before increasing max_mds
+fi
+fs=0
+for name in a b c d e f g h i j k l m n o p
+do
+    if [ "$CEPH_MAX_MDS" -gt 1 ]; then
+        ceph_adm fs set "cephfs_${name}" allow_multimds true --yes-i-really-mean-it
+        ceph_adm fs set "cephfs_${name}" max_mds "$CEPH_MAX_MDS"
+    fi
+    fs=$(($fs + 1))
+    [ $fs -eq $CEPH_NUM_FS ] && break
+done
+
 if [ "$CEPH_NUM_MGR" -gt 0 ]; then
     mgr=0
     for name in x y z a b c d e f g h i j k l m n o p
@@ -755,9 +789,9 @@ if [ "$CEPH_NUM_MGR" -gt 0 ]; then
             ceph_adm -i $key_fn auth add mgr.$name mon 'allow *'
         fi
 
-        cat <<EOF >> $conf_fn
+        wconf <<EOF
 [mgr.$name]
-
+        host = $HOSTNAME
 EOF
 
         echo "Starting mgr.${name}"
@@ -854,9 +888,12 @@ do_rgw()
 
     RGWSUDO=
     [ $CEPH_RGW_PORT -lt 1024 ] && RGWSUDO=sudo
-    run 'rgw' $RGWSUDO $CEPH_BIN/radosgw -c $conf_fn --log-file=${CEPH_OUT_DIR}/rgw.log ${RGWDEBUG} --debug-ms=1
+    n=$(($CEPH_NUM_RGW - 1))
+    for rgw in `seq 0 $n`; do
+	run 'rgw' $RGWSUDO $CEPH_BIN/radosgw -c $conf_fn --log-file=${CEPH_OUT_DIR}/rgw.$rgw.log ${RGWDEBUG} --debug-ms=1
+    done
 }
-if [ "$start_rgw" -eq 1 ]; then
+if [ "$CEPH_NUM_RGW" -gt 0 ]; then
     do_rgw
 fi
 

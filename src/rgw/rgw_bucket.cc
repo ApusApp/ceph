@@ -25,6 +25,7 @@
 
 #include "cls/user/cls_user_types.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 #define BUCKET_TAG_TIMEOUT 30
@@ -132,9 +133,8 @@ int rgw_read_user_buckets(RGWRados * store,
     if (ret < 0)
       return ret;
 
-    for (list<cls_user_bucket_entry>::iterator q = entries.begin(); q != entries.end(); ++q) {
-      RGWBucketEnt e(*q);
-      buckets.add(e);
+    for (const auto& entry : entries) {
+      buckets.add(RGWBucketEnt(user_id, entry));
       total++;
     }
 
@@ -224,6 +224,7 @@ int rgw_link_bucket(RGWRados *store, const rgw_user& user_id, rgw_bucket& bucket
 
   ep.linked = true;
   ep.owner = user_id;
+  ep.bucket = bucket;
   ret = store->put_bucket_entrypoint_info(tenant_name, bucket_name, ep, false, ot, real_time(), &attrs);
   if (ret < 0)
     goto done_err;
@@ -588,7 +589,7 @@ int rgw_remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
 static int aio_wait(librados::AioCompletion *handle)
 {
   librados::AioCompletion *c = (librados::AioCompletion *)handle;
-  c->wait_for_complete();
+  c->wait_for_safe();
   int ret = c->get_return_value();
   c->release();
   return ret;
@@ -649,7 +650,7 @@ int rgw_remove_bucket_bypass_gc(RGWRados *store, rgw_bucket& bucket,
       rgw_obj obj(bucket, (*it).key.name);
       obj.set_instance((*it).key.instance);
 
-      ret = store->get_obj_state(&obj_ctx, obj, &astate, NULL);
+      ret = store->get_obj_state(&obj_ctx, obj, &astate, false);
       if (ret == -ENOENT) {
         dout(1) << "WARNING: cannot find obj state for obj " << obj.get_object() << dendl;
         continue;
@@ -891,7 +892,7 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
     rgw_obj obj_bucket_instance(bucket_instance, no_oid);
     r = store->system_obj_set_attr(NULL, obj_bucket_instance, RGW_ATTR_ACL, aclbl, &objv_tracker);
 
-    r = rgw_link_bucket(store, user_info.user_id, bucket, real_time());
+    r = rgw_link_bucket(store, user_info.user_id, bucket_info.bucket, real_time());
     if (r < 0)
       return r;
   }
@@ -975,11 +976,7 @@ static void dump_bucket_usage(map<RGWObjCategory, RGWStorageStats>& stats, Forma
     RGWStorageStats& s = iter->second;
     const char *cat_name = rgw_obj_category_name(iter->first);
     formatter->open_object_section(cat_name);
-    formatter->dump_int("size", s.size);
-    formatter->dump_int("size_actual", s.size_rounded);
-    formatter->dump_int("size_kb", rgw_rounded_kb(s.size));
-    formatter->dump_int("size_kb_actual", rgw_rounded_kb(s.size_rounded));
-    formatter->dump_int("num_objects", s.num_objects);
+    s.dump(formatter);
     formatter->close_section();
   }
   formatter->close_section();
@@ -1094,7 +1091,8 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
 }
 
 int RGWBucket::check_object_index(RGWBucketAdminOpState& op_state,
-        map<string, RGWObjEnt> result, std::string *err_msg)
+                                  RGWFormatterFlusher& flusher,
+                                  std::string *err_msg)
 {
 
   bool fix_index = op_state.will_fix_index();
@@ -1115,6 +1113,8 @@ int RGWBucket::check_object_index(RGWBucketAdminOpState& op_state,
   rgw_obj_key marker;
   bool is_truncated = true;
 
+  Formatter *formatter = flusher.get_formatter();
+  formatter->open_object_section("objects");
   while (is_truncated) {
     map<string, RGWObjEnt> result;
 
@@ -1126,7 +1126,14 @@ int RGWBucket::check_object_index(RGWBucketAdminOpState& op_state,
     } else if (r < 0 && r != -ENOENT) {
       set_err_msg(err_msg, "ERROR: failed operation r=" + cpp_strerror(-r));
     }
+
+
+    dump_bucket_index(result, formatter);
+    flusher.flush();
+
   }
+
+  formatter->close_section();
 
   store->cls_obj_set_bucket_tag_timeout(bucket, 0);
 
@@ -1325,12 +1332,9 @@ int RGWBucketAdminOp::check_index(RGWRados *store, RGWBucketAdminOpState& op_sta
   dump_mulipart_index_results(objs_to_unlink, formatter);
   flusher.flush();
 
-  ret = bucket.check_object_index(op_state, result);
+  ret = bucket.check_object_index(op_state, flusher);
   if (ret < 0)
     return ret;
-
-  dump_bucket_index(result,  formatter);
-  flusher.flush();
 
   ret = bucket.check_index(op_state, existing_stats, calculated_stats);
   if (ret < 0)
@@ -1795,7 +1799,7 @@ int RGWDataChangesLog::list_entries(const real_time& start_time, const real_time
 
 int RGWDataChangesLog::get_info(int shard_id, RGWDataChangesLogInfo *info)
 {
-  if (shard_id > num_shards)
+  if (shard_id >= num_shards)
     return -EINVAL;
 
   string oid = oids[shard_id];
@@ -1869,7 +1873,7 @@ void *RGWDataChangesLog::ChangesRenewThread::entry() {
 
     int interval = cct->_conf->rgw_data_log_window * 3 / 4;
     lock.Lock();
-    cond.WaitInterval(cct, lock, utime_t(interval, 0));
+    cond.WaitInterval(lock, utime_t(interval, 0));
     lock.Unlock();
   } while (!log->going_down());
 
@@ -1920,9 +1924,9 @@ void RGWBucketCompleteInfo::decode_json(JSONObj *obj) {
 class RGWBucketMetadataHandler : public RGWMetadataHandler {
 
 public:
-  string get_type() { return "bucket"; }
+  string get_type() override { return "bucket"; }
 
-  int get(RGWRados *store, string& entry, RGWMetadataObject **obj) {
+  int get(RGWRados *store, string& entry, RGWMetadataObject **obj) override {
     RGWObjVersionTracker ot;
     RGWBucketEntryPoint be;
 
@@ -1944,7 +1948,7 @@ public:
   }
 
   int put(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker,
-          real_time mtime, JSONObj *obj, sync_type_t sync_type) {
+          real_time mtime, JSONObj *obj, sync_type_t sync_type) override {
     RGWBucketEntryPoint be, old_be;
     try {
       decode_json_obj(be, obj);
@@ -1992,7 +1996,7 @@ public:
     RGWListRawObjsCtx ctx;
   };
 
-  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) {
+  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) override {
     RGWBucketEntryPoint be;
     RGWObjectCtx obj_ctx(store);
 
@@ -2020,12 +2024,12 @@ public:
     return 0;
   }
 
-  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) {
+  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) override {
     oid = key;
     bucket = store->get_zone_params().domain_root;
   }
 
-  int list_keys_init(RGWRados *store, void **phandle)
+  int list_keys_init(RGWRados *store, void **phandle) override
   {
     list_keys_info *info = new list_keys_info;
 
@@ -2036,7 +2040,7 @@ public:
     return 0;
   }
 
-  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) {
+  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
 
     string no_filter;
@@ -2070,7 +2074,7 @@ public:
     return 0;
   }
 
-  void list_keys_complete(void *handle) {
+  void list_keys_complete(void *handle) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
     delete info;
   }
@@ -2079,9 +2083,9 @@ public:
 class RGWBucketInstanceMetadataHandler : public RGWMetadataHandler {
 
 public:
-  string get_type() { return "bucket.instance"; }
+  string get_type() override { return "bucket.instance"; }
 
-  int get(RGWRados *store, string& oid, RGWMetadataObject **obj) {
+  int get(RGWRados *store, string& oid, RGWMetadataObject **obj) override {
     RGWBucketCompleteInfo bci;
 
     real_time mtime;
@@ -2099,7 +2103,7 @@ public:
   }
 
   int put(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker,
-          real_time mtime, JSONObj *obj, sync_type_t sync_type) {
+          real_time mtime, JSONObj *obj, sync_type_t sync_type) override {
     RGWBucketCompleteInfo bci, old_bci;
     try {
       decode_json_obj(bci, obj);
@@ -2142,7 +2146,6 @@ public:
       bci.info.bucket.data_pool = old_bci.info.bucket.data_pool;
       bci.info.bucket.index_pool = old_bci.info.bucket.index_pool;
       bci.info.bucket.data_extra_pool = old_bci.info.bucket.data_extra_pool;
-      bci.info.index_type = old_bci.info.index_type;
     }
 
     // are we actually going to perform this put, or is it too old?
@@ -2175,7 +2178,7 @@ public:
     RGWListRawObjsCtx ctx;
   };
 
-  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) {
+  int remove(RGWRados *store, string& entry, RGWObjVersionTracker& objv_tracker) override {
     RGWBucketInfo info;
     RGWObjectCtx obj_ctx(store);
 
@@ -2186,13 +2189,13 @@ public:
     return rgw_bucket_instance_remove_entry(store, entry, &info.objv_tracker);
   }
 
-  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) {
+  void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) override {
     oid = RGW_BUCKET_INSTANCE_MD_PREFIX + key;
     rgw_bucket_instance_key_to_oid(oid);
     bucket = store->get_zone_params().domain_root;
   }
 
-  int list_keys_init(RGWRados *store, void **phandle)
+  int list_keys_init(RGWRados *store, void **phandle) override
   {
     list_keys_info *info = new list_keys_info;
 
@@ -2203,7 +2206,7 @@ public:
     return 0;
   }
 
-  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) {
+  int list_keys_next(void *handle, int max, list<string>& keys, bool *truncated) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
 
     string no_filter;
@@ -2240,7 +2243,7 @@ public:
     return 0;
   }
 
-  void list_keys_complete(void *handle) {
+  void list_keys_complete(void *handle) override {
     list_keys_info *info = static_cast<list_keys_info *>(handle);
     delete info;
   }
@@ -2250,7 +2253,7 @@ public:
    * point, so that the log entries end up at the same log shard, so that we process them
    * in order
    */
-  virtual void get_hash_key(const string& section, const string& key, string& hash_key) {
+  void get_hash_key(const string& section, const string& key, string& hash_key) override {
     string k;
     int pos = key.find(':');
     if (pos < 0)

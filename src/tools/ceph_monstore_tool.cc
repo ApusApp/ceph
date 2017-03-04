@@ -272,7 +272,7 @@ int update_osdmap(MonitorDBStore& store, version_t ver, bool copy,
     OSDMap::Incremental inc(bl);
     if (inc.crush.length()) {
       inc.crush.clear();
-      crush->encode(inc.crush);
+      crush->encode(inc.crush, CEPH_FEATURES_SUPPORTED_DEFAULT);
     }
     if (inc.fullmap.length()) {
       OSDMap fullmap;
@@ -436,7 +436,7 @@ int rewrite_crush(const char* progname,
   // store the transaction into store as a proposal
   const string prefix("paxos");
   version_t pending_v = store.get(prefix, "last_committed") + 1;
-  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  auto t(std::make_shared<MonitorDBStore::Transaction>());
   bufferlist bl;
   rewrite_txn.encode(bl);
   cout << "adding pending commit " << pending_v
@@ -482,7 +482,7 @@ int inflate_pgmap(MonitorDBStore& st, unsigned n, bool can_be_trimmed) {
 
   version_t first = st.get("pgmap", "first_committed");
   version_t ver = last;
-  MonitorDBStore::TransactionRef txn(new MonitorDBStore::Transaction);
+  auto txn(std::make_shared<MonitorDBStore::Transaction>());
   for (unsigned i = 0; i < n; i++) {
     bufferlist trans_bl;
     bufferlist dirty_pgs;
@@ -494,7 +494,7 @@ int inflate_pgmap(MonitorDBStore& st, unsigned n, bool can_be_trimmed) {
       }
       ::encode(ps->second, dirty_pgs);
     }
-    utime_t inc_stamp = ceph_clock_now(NULL);
+    utime_t inc_stamp = ceph_clock_now();
     ::encode(inc_stamp, trans_bl);
     ::encode_destructively(dirty_pgs, trans_bl);
     bufferlist dirty_osds;
@@ -532,6 +532,10 @@ static int update_auth(MonitorDBStore& st, const string& keyring_path)
     KeyServerData::Incremental auth_inc;
     auth_inc.name = k.first;
     auth_inc.auth = k.second;
+    if (auth_inc.auth.caps.empty()) {
+      cerr << "no caps granted to: " << auth_inc.name << std::endl;
+      return -EINVAL;
+    }
     auth_inc.op = KeyServerData::AUTH_INC_ADD;
 
     AuthMonitor::Incremental inc;
@@ -593,7 +597,8 @@ static int update_paxos(MonitorDBStore& st)
   bufferlist pending_proposal;
   {
     MonitorDBStore::Transaction t;
-    vector<string> prefixes = {"auth", "osdmap", "pgmap", "pgmap_pg"};
+    vector<string> prefixes = {"auth", "osdmap",
+			       "pgmap", "pgmap_pg", "pgmap_meta"};
     for (const auto& prefix : prefixes) {
       for (auto i = st.get_iterator(prefix); i->valid(); i->next()) {
 	auto key = i->raw_key();
@@ -611,6 +616,52 @@ static int update_paxos(MonitorDBStore& st)
   t->put(prefix, pending_v, pending_proposal);
   t->put(prefix, "pending_v", pending_v);
   t->put(prefix, "pending_pn", 400);
+  st.apply_transaction(t);
+  return 0;
+}
+
+// rebuild
+//  - pgmap_meta/version
+//  - pgmap_meta/last_osdmap_epoch
+//  - pgmap_meta/last_pg_scan
+//  - pgmap_meta/full_ratio
+//  - pgmap_meta/nearfull_ratio
+//  - pgmap_meta/stamp
+static int update_pgmap_meta(MonitorDBStore& st)
+{
+  const string prefix("pgmap_meta");
+  auto t = make_shared<MonitorDBStore::Transaction>();
+  // stolen from PGMonitor::create_pending()
+  // the first pgmap_meta
+  t->put(prefix, "version", 1);
+  {
+    auto stamp = ceph_clock_now();
+    bufferlist bl;
+    ::encode(stamp, bl);
+    t->put(prefix, "stamp", bl);
+  }
+  {
+    auto last_osdmap_epoch = st.get("osdmap", "last_committed");
+    t->put(prefix, "last_osdmap_epoch", last_osdmap_epoch);
+  }
+  // be conservative, so PGMonitor will scan the all pools for pg changes
+  t->put(prefix, "last_pg_scan", 1);
+  {
+    auto full_ratio = g_ceph_context->_conf->mon_osd_full_ratio;
+    if (full_ratio > 1.0)
+      full_ratio /= 100.0;
+    bufferlist bl;
+    ::encode(full_ratio, bl);
+    t->put(prefix, "full_ratio", bl);
+  }
+  {
+    auto nearfull_ratio = g_ceph_context->_conf->mon_osd_nearfull_ratio;
+    if (nearfull_ratio > 1.0)
+      nearfull_ratio /= 100.0;
+    bufferlist bl;
+    ::encode(nearfull_ratio, bl);
+    t->put(prefix, "nearfull_ratio", bl);
+  }
   st.apply_transaction(t);
   return 0;
 }
@@ -635,6 +686,9 @@ int rebuild_monstore(const char* progname,
   }
   if (!keyring_path.empty())
     update_auth(st, keyring_path);
+  if ((r = update_pgmap_meta(st))) {
+    return r;
+  }
   if ((r = update_paxos(st))) {
     return r;
   }
@@ -733,7 +787,7 @@ int main(int argc, char **argv) {
     ceph_options.push_back(i->c_str());
   }
 
-  global_init(
+  auto cct = global_init(
     &def_args, ceph_options, CEPH_ENTITY_TYPE_MON,
     CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
@@ -838,7 +892,7 @@ int main(int argc, char **argv) {
       if (r >= 0) {
         OSDMap osdmap;
         osdmap.decode(tmp);
-        osdmap.crush->encode(bl);
+        osdmap.crush->encode(bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
       }
     } else {
       r = st.get(map_type, v, bl);
@@ -958,7 +1012,7 @@ int main(int argc, char **argv) {
       if (bl.length() == 0)
 	break;
       cout << "\n--- " << v << " ---" << std::endl;
-      MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+      auto tx(std::make_shared<MonitorDBStore::Transaction>());
       Paxos::decode_append_transaction(tx, bl);
       JSONFormatter f(true);
       tx->dump(&f);
@@ -1138,7 +1192,7 @@ int main(int argc, char **argv) {
     unsigned num = 0;
     for (unsigned i = 0; i < ntrans; ++i) {
       std::cerr << "Applying trans " << i << std::endl;
-      MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+      auto t(std::make_shared<MonitorDBStore::Transaction>());
       string prefix;
       prefix.push_back((i%26)+'a');
       for (unsigned j = 0; j < tsize; ++j) {
@@ -1180,7 +1234,7 @@ int main(int argc, char **argv) {
     do {
       uint64_t num_keys = 0;
 
-      MonitorDBStore::TransactionRef tx(new MonitorDBStore::Transaction);
+      auto tx(std::make_shared<MonitorDBStore::Transaction>());
 
       while (it->valid() && num_keys < 128) {
         pair<string,string> k = it->raw_key();

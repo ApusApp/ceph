@@ -1,9 +1,18 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include <boost/algorithm/string.hpp>
+#include <boost/lexical_cast.hpp>
+
 #include "librbd/Utils.h"
 #include "include/rbd_types.h"
 #include "include/stringify.h"
+#include "include/rbd/features.h"
+#include "common/dout.h"
+
+#define dout_subsys ceph_subsys_rbd
+#undef dout_prefix
+#define dout_prefix *_dout << "librbd: "
 
 namespace librbd {
 namespace util {
@@ -47,13 +56,19 @@ std::string generate_image_id(librados::IoCtx &ioctx) {
   std::string id = bid_ss.str();
 
   // ensure the image id won't overflow the fixed block name size
-  const size_t max_id_length = RBD_MAX_BLOCK_NAME_SIZE - strlen(RBD_DATA_PREFIX) - 1;
-  if (id.length() > max_id_length) {
-    id = id.substr(id.length() - max_id_length);
+  if (id.length() > RBD_MAX_IMAGE_ID_LENGTH) {
+    id = id.substr(id.length() - RBD_MAX_IMAGE_ID_LENGTH);
   }
 
   return id;
 }
 
+uint64_t get_rbd_default_features(CephContext* cct)
+{
+  auto str_val = cct->_conf->get_val<std::string>("rbd_default_features");
+  return boost::lexical_cast<uint64_t>(str_val);
+}
+
 } // namespace util
+
 } // namespace librbd

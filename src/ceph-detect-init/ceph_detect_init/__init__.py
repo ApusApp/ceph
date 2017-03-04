@@ -13,6 +13,8 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
+from ceph_detect_init import alpine
+from ceph_detect_init import arch
 from ceph_detect_init import centos
 from ceph_detect_init import debian
 from ceph_detect_init import exc
@@ -20,6 +22,9 @@ from ceph_detect_init import fedora
 from ceph_detect_init import rhel
 from ceph_detect_init import suse
 from ceph_detect_init import gentoo
+from ceph_detect_init import freebsd
+from ceph_detect_init import docker
+import os
 import logging
 import platform
 
@@ -52,6 +57,8 @@ def _get_distro(distro, use_rhceph=False):
 
     distro = _normalized_distro_name(distro)
     distributions = {
+        'alpine': alpine,
+        'arch': arch,
         'debian': debian,
         'ubuntu': debian,
         'linuxmint': debian,
@@ -63,6 +70,8 @@ def _get_distro(distro, use_rhceph=False):
         'gentoo': gentoo,
         'funtoo': gentoo,
         'exherbo': gentoo,
+        'freebsd': freebsd,
+        'docker': docker,
     }
 
     if distro == 'redhat' and use_rhceph:
@@ -88,9 +97,36 @@ def _normalized_distro_name(distro):
 
 def platform_information():
     """detect platform information from remote host."""
-    logging.debug('platform_information: linux_distribution = ' +
-                  str(platform.linux_distribution()))
-    distro, release, codename = platform.linux_distribution()
+    try:
+        file_name = '/proc/self/cgroup'
+        with open(file_name, 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                if "docker" in line.split(':')[2]:
+                    return ('docker', 'docker', 'docker')
+    except Exception as err:
+        logging.debug("platform_information: ",
+                      "Error while opening %s : %s" % (file_name, err))
+
+    if os.path.isfile('/.dockerenv'):
+        return ('docker', 'docker', 'docker')
+
+    if platform.system() == 'Linux':
+        linux_distro = platform.linux_distribution(
+            supported_dists=platform._supported_dists + ('alpine', 'arch'))
+        logging.debug('platform_information: linux_distribution = ' +
+                      str(linux_distro))
+        distro, release, codename = linux_distro
+    elif platform.system() == 'FreeBSD':
+        distro = 'freebsd'
+        release = platform.release()
+        codename = platform.version().split(' ')[3].split(':')[0]
+        logging.debug(
+            'platform_information: release = {}, version = {}'.format(
+                platform.release(), platform.version()))
+    else:
+        raise exc.UnsupportedPlatform(platform.system(), '', '')
+
     # this could be an empty string in Debian
     if not codename and 'debian' in distro.lower():
         debian_codenames = {

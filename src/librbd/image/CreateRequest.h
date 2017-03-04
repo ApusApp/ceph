@@ -35,10 +35,12 @@ public:
                                const ImageOptions &image_options,
                                const std::string &non_primary_global_image_id,
                                const std::string &primary_mirror_uuid,
+                               bool skip_mirror_enable,
                                ContextWQ *op_work_queue, Context *on_finish) {
     return new CreateRequest(ioctx, image_name, image_id, size, image_options,
                              non_primary_global_image_id, primary_mirror_uuid,
-                             op_work_queue, on_finish);
+                             skip_mirror_enable, op_work_queue,
+                             on_finish);
   }
 
   static int validate_order(CephContext *cct, uint8_t order);
@@ -60,7 +62,10 @@ private:
    * |               |                   v
    * |               |          ADD IMAGE TO DIRECTORY
    * |               |               /   |
-   * |      REMOVE ID OBJECT<-------/    v         (stripingv2 disabled)
+   * |      REMOVE ID OBJECT<-------/    v
+   * |               |           NEGOTIATE FEATURES (when using default features)
+   * |               |                   |
+   * |               |                   v         (stripingv2 disabled)
    * |               |              CREATE IMAGE. . . . > . . . .
    * v               |               /   |                      .
    * |      REMOVE FROM DIR<--------/    v                      .
@@ -76,14 +81,9 @@ private:
    * |               |\             JOURNAL CREATE              .
    * |               | \               /  |                     .
    * v               |  *<------------/   v                     .
-   * |               |           FETCH MIRROR IMAGE             v
+   * |               |           MIRROR IMAGE ENABLE            .
    * |               |                /   |                     .
-   * |        JOURNAL REMOVE<--------/    v                     .
-   * |                \          MIRROR IMAGE ENABLE            .
-   * |                 \               /  |                     .
-   * |                  *<------------/   v                     .
-   * |                              NOTIFY WATCHERS             .
-   * |                                    |                     .
+   * |        JOURNAL REMOVE*<-------/    |                     .
    * |                                    v                     .
    * |_____________>___________________<finish> . . . . < . . . .
    *
@@ -95,6 +95,7 @@ private:
                 const ImageOptions &image_options,
                 const std::string &non_primary_global_image_id,
                 const std::string &primary_mirror_uuid,
+                bool skip_mirror_enable,
                 ContextWQ *op_work_queue, Context *on_finish);
 
   IoCtx m_ioctx;
@@ -112,6 +113,8 @@ private:
   int64_t m_data_pool_id = -1;
   const std::string m_non_primary_global_image_id;
   const std::string m_primary_mirror_uuid;
+  bool m_skip_mirror_enable;
+  bool m_negotiate_features = false;
 
   ContextWQ *m_op_work_queue;
   Context *m_on_finish;
@@ -135,6 +138,9 @@ private:
   void add_image_to_directory();
   Context *handle_add_image_to_directory(int *result);
 
+  void negotiate_features();
+  Context *handle_negotiate_features(int *result);
+
   void create_image();
   Context *handle_create_image(int *result);
 
@@ -150,14 +156,8 @@ private:
   void journal_create();
   Context *handle_journal_create(int *result);
 
-  void fetch_mirror_image();
-  Context *handle_fetch_mirror_image(int *result);
-
   void mirror_image_enable();
   Context *handle_mirror_image_enable(int *result);
-
-  void send_watcher_notification();
-  void handle_watcher_notify(int r);
 
   void complete(int r);
 

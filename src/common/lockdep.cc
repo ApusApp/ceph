@@ -129,7 +129,7 @@ int lockdep_dump_locks()
 	 ++q) {
       lockdep_dout(0) << "  * " << lock_names[q->first] << "\n";
       if (q->second)
-	q->second->print(*_dout);
+	*_dout << *(q->second);
       *_dout << dendl;
     }
   }
@@ -296,7 +296,7 @@ int lockdep_will_lock(const char *name, int id, bool force_backtrace)
       }
       delete bt;
       *_dout << dendl;
-      assert(0);
+      ceph_abort();
     }
     else if (!(follows[p->first][id/8] & (1 << (id % 8)))) {
       // new dependency
@@ -327,7 +327,7 @@ int lockdep_will_lock(const char *name, int id, bool force_backtrace)
 	// don't add this dependency, or we'll get aMutex. cycle in the graph, and
 	// does_follow() won't terminate.
 
-	assert(0);  // actually, we should just die here.
+	ceph_abort();  // actually, we should just die here.
       } else {
         BackTrace *bt = NULL;
         if (force_backtrace || lockdep_force_backtrace()) {

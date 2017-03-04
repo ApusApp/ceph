@@ -439,7 +439,7 @@ public:
     try {
       tx_buffer_it.advance(l);
     } catch (buffer::end_of_buffer &e) {
-      assert(0);
+      ceph_abort();
     }
 
     return l;
@@ -452,7 +452,7 @@ public:
 class RGW_Auth_S3 {
 private:
   static int authorize_v2(RGWRados *store, struct req_state *s);
-  static int authorize_v4(RGWRados *store, struct req_state *s);
+  static int authorize_v4(RGWRados *store, struct req_state *s, bool force_boto2_compat = true);
   static int authorize_v4_complete(RGWRados *store, struct req_state *s,
 				  const string& request_payload,
 				  bool unsigned_payload);
@@ -470,7 +470,9 @@ public:
   static int validate_bucket_name(const string& bucket);
   static int validate_object_name(const string& bucket);
 
-  virtual int init(RGWRados *store, struct req_state *s, RGWClientIO *cio);
+  virtual int init(RGWRados *store,
+                   struct req_state *s,
+                   rgw::io::BasicClient *cio);
   virtual int authorize() {
     return RGW_Auth_S3::authorize(store, s);
   }
@@ -485,7 +487,9 @@ public:
   RGWHandler_REST_S3() : RGWHandler_REST() {}
   virtual ~RGWHandler_REST_S3() {}
 
-  virtual int init(RGWRados *store, struct req_state *s, RGWClientIO *cio);
+  virtual int init(RGWRados *store,
+                   struct req_state *s,
+                   rgw::io::BasicClient *cio);
   virtual int authorize() {
     return RGW_Auth_S3::authorize(store, s);
   }
@@ -499,6 +503,7 @@ protected:
   }
   RGWOp *op_get();
   RGWOp *op_head();
+  RGWOp *op_post();
 public:
   RGWHandler_REST_Service_S3() {}
   virtual ~RGWHandler_REST_Service_S3() {}
@@ -562,13 +567,14 @@ class RGWRESTMgr_S3 : public RGWRESTMgr {
 private:
   bool enable_s3website;
 public:
-  explicit RGWRESTMgr_S3(bool _enable_s3website = false)
-    : enable_s3website(_enable_s3website)
-    {}
+  explicit RGWRESTMgr_S3(bool enable_s3website = false)
+    : enable_s3website(enable_s3website) {
+  }
 
-  virtual ~RGWRESTMgr_S3() {}
+  virtual ~RGWRESTMgr_S3() = default;
 
-  virtual RGWHandler_REST *get_handler(struct req_state *s);
+  RGWHandler_REST *get_handler(struct req_state* s,
+                               const std::string& frontend_prefix) override;
 };
 
 class RGWHandler_REST_Obj_S3Website;
@@ -755,10 +761,9 @@ private:
   std::string signature;
 
 public:
-  RGWGetPolicyV2Extractor(std::string access_key_id, std::string signature) {
-    access_key_id = std::move(access_key_id),
-    signature = std::move(signature);
-  }
+  RGWGetPolicyV2Extractor(std::string access_key_id, std::string signature)
+    : access_key_id(std::move(access_key_id)),
+      signature(std::move(signature)) {}
 
   void get_auth_keys(std::string& access_key_id,
                       std::string& signature,

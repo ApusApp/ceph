@@ -31,6 +31,7 @@
 #include "StrayManager.h"
 #include "MDSContext.h"
 #include "MDSMap.h"
+#include "Mutation.h"
 
 #include "messages/MClientRequest.h"
 #include "messages/MMDSSlaveRequest.h"
@@ -67,10 +68,6 @@ struct MClientSnap;
 class MMDSFragmentNotify;
 
 class ESubtreeMap;
-
-struct MDRequestImpl;
-typedef ceph::shared_ptr<MDRequestImpl> MDRequestRef;
-struct MDSlaveUpdate;
 
 enum {
   l_mdc_first = 3000,
@@ -135,13 +132,19 @@ class MDCache {
 
   set<CInode*> base_inodes;
 
-  PerfCounters *logger;
+  std::unique_ptr<PerfCounters> logger;
 
   Filer filer;
+
+  bool exceeded_size_limit;
 
 public:
   void advance_stray() {
     stray_index = (stray_index+1)%NUM_STRAY;
+  }
+
+  void activate_stray_manager() {
+    stray_manager.activate();
   }
 
   /**
@@ -214,10 +217,21 @@ public:
     frag_t frag;
     snapid_t snap;
     filepath want_path;
+    MDSCacheObject *base;
     bool want_base_dir;
     bool want_xlocked;
 
-    discover_info_t() : tid(0), mds(-1), snap(CEPH_NOSNAP), want_base_dir(false), want_xlocked(false) {}
+    discover_info_t() :
+      tid(0), mds(-1), snap(CEPH_NOSNAP), base(NULL),
+      want_base_dir(false), want_xlocked(false) {}
+    ~discover_info_t() {
+      if (base)
+	base->put(MDSCacheObject::PIN_DISCOVERBASE);
+    }
+    void pin_base(MDSCacheObject *b) {
+      base = b;
+      base->get(MDSCacheObject::PIN_DISCOVERBASE);
+    }
   };
 
   map<ceph_tid_t, discover_info_t> discovers;
@@ -348,7 +362,7 @@ public:
   void project_rstat_inode_to_frag(CInode *cur, CDir *parent, snapid_t first,
 				   int linkunlink, SnapRealm *prealm);
   void _project_rstat_inode_to_frag(inode_t& inode, snapid_t ofirst, snapid_t last,
-				    CDir *parent, int linkunlink=0);
+				    CDir *parent, int linkunlink, bool update_inode);
   void project_rstat_frag_to_inode(nest_info_t& rstat, nest_info_t& accounted_rstat,
 				   snapid_t ofirst, snapid_t last, 
 				   CInode *pin, bool cow_head);
@@ -366,6 +380,10 @@ public:
   }
   void wait_for_uncommitted_master(metareqid_t reqid, MDSInternalContextBase *c) {
     uncommitted_masters[reqid].waiters.push_back(c);
+  }
+  bool have_uncommitted_master(metareqid_t reqid, mds_rank_t from) {
+    auto p = uncommitted_masters.find(reqid);
+    return p != uncommitted_masters.end() && p->second.slaves.count(from) > 0;
   }
   void log_master_commit(metareqid_t reqid);
   void logged_master_update(metareqid_t reqid);
@@ -424,7 +442,8 @@ protected:
   void process_delayed_resolve();
   void discard_delayed_resolve(mds_rank_t who);
   void maybe_resolve_finish();
-  void disambiguate_imports();
+  void disambiguate_my_imports();
+  void disambiguate_other_imports();
   void trim_unlinked_inodes();
   void add_uncommitted_slave_update(metareqid_t reqid, mds_rank_t master, MDSlaveUpdate*);
   void finish_uncommitted_slave_update(metareqid_t reqid, mds_rank_t master);
@@ -434,17 +453,19 @@ public:
   void remove_inode_recursive(CInode *in);
 
   bool is_ambiguous_slave_update(metareqid_t reqid, mds_rank_t master) {
-    return ambiguous_slave_updates.count(master) &&
-	   ambiguous_slave_updates[master].count(reqid);
+    auto p = ambiguous_slave_updates.find(master);
+    return p != ambiguous_slave_updates.end() && p->second.count(reqid);
   }
   void add_ambiguous_slave_update(metareqid_t reqid, mds_rank_t master) {
     ambiguous_slave_updates[master].insert(reqid);
   }
   void remove_ambiguous_slave_update(metareqid_t reqid, mds_rank_t master) {
-    assert(ambiguous_slave_updates[master].count(reqid));
-    ambiguous_slave_updates[master].erase(reqid);
-    if (ambiguous_slave_updates[master].empty())
-      ambiguous_slave_updates.erase(master);
+    auto p = ambiguous_slave_updates.find(master);
+    auto q = p->second.find(reqid);
+    assert(q != p->second.end());
+    p->second.erase(q);
+    if (p->second.empty())
+      ambiguous_slave_updates.erase(p);
   }
 
   void add_rollback(metareqid_t reqid, mds_rank_t master) {
@@ -523,8 +544,8 @@ protected:
     if (rejoins_pending)
       rejoin_send_rejoins();
   }
-  MDSInternalContext *rejoin_done;
-  MDSInternalContext *resolve_done;
+  std::unique_ptr<MDSInternalContext> rejoin_done;
+  std::unique_ptr<MDSInternalContext> resolve_done;
 public:
   void rejoin_start(MDSInternalContext *rejoin_done_);
   void rejoin_gather_finish();
@@ -637,7 +658,7 @@ public:
   void _queued_file_recover_cow(CInode *in, MutationRef& mut);
 
   // subsystems
-  Migrator *migrator;
+  std::unique_ptr<Migrator> migrator;
 
  public:
   explicit MDCache(MDSRank *m);
@@ -692,6 +713,8 @@ public:
 
   void trim_client_leases();
   void check_memory_usage();
+
+  utime_t last_recall_state;
 
   // shutdown
   void shutdown_start();
@@ -877,11 +900,6 @@ public:
    */
   int path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBase *fin, const filepath& path,
 		    vector<CDentry*> *pdnvec, CInode **pin, int onfail);
-  bool path_is_mine(filepath& path);
-  bool path_is_mine(string& p) {
-    filepath path(p, 1);
-    return path_is_mine(path);
-  }
 
   CInode *cache_traverse(const filepath& path);
 
@@ -913,10 +931,12 @@ protected:
     bool want_xlocked;
     version_t tid;
     int64_t pool;
+    int last_err;
     list<MDSInternalContextBase*> waiters;
     open_ino_info_t() : checking(MDS_RANK_NONE), auth_hint(MDS_RANK_NONE),
       check_peers(true), fetch_backtrace(true), discover(false),
-      want_replica(false), want_xlocked(false), tid(0), pool(-1) {}
+      want_replica(false), want_xlocked(false), tid(0), pool(-1),
+      last_err(0) {}
   };
   ceph_tid_t open_ino_last_tid;
   map<inodeno_t,open_ino_info_t> opening_inodes;
@@ -924,15 +944,14 @@ protected:
   void _open_ino_backtrace_fetched(inodeno_t ino, bufferlist& bl, int err);
   void _open_ino_parent_opened(inodeno_t ino, int ret);
   void _open_ino_traverse_dir(inodeno_t ino, open_ino_info_t& info, int err);
-  void _open_ino_fetch_dir(inodeno_t ino, MMDSOpenIno *m, CDir *dir);
-  MDSInternalContextBase* _open_ino_get_waiter(inodeno_t ino, MMDSOpenIno *m);
+  void _open_ino_fetch_dir(inodeno_t ino, MMDSOpenIno *m, CDir *dir, bool parent);
   int open_ino_traverse_dir(inodeno_t ino, MMDSOpenIno *m,
 			    vector<inode_backpointer_t>& ancestors,
 			    bool discover, bool want_xlocked, mds_rank_t *hint);
   void open_ino_finish(inodeno_t ino, open_ino_info_t& info, int err);
   void do_open_ino(inodeno_t ino, open_ino_info_t& info, int err);
   void do_open_ino_peer(inodeno_t ino, open_ino_info_t& info);
-  void handle_open_ino(MMDSOpenIno *m);
+  void handle_open_ino(MMDSOpenIno *m, int err=0);
   void handle_open_ino_reply(MMDSOpenInoReply *m);
   friend class C_IO_MDC_OpenInoBacktraceFetched;
   friend struct C_MDC_OpenInoTraverseDir;

@@ -327,14 +327,12 @@ authentication in the ``[global]`` section of your Ceph configuration file. ::
 	auth service required = cephx
 	auth client required = cephx
 
-Additionally, you should enable message signing. See `Cephx Config Reference`_
-and  `Cephx Authentication`_ for details. 
+Additionally, you should enable message signing. See `Cephx Config Reference`_ for details. 
 
 .. important:: When upgrading, we recommend expressly disabling authentication 
    first, then perform the upgrade. Once the upgrade is complete, re-enable 
    authentication.
 
-.. _Cephx Authentication: ../../operations/authentication
 .. _Cephx Config Reference: ../auth-config-ref
 
 
@@ -526,7 +524,6 @@ To invoke a cluster other than the default ``ceph`` cluster, use the
 
 
 .. _Hardware Recommendations: ../../../start/hardware-recommendations
-.. _hardware recommendations: ../../../start/hardware-recommendations
 .. _Network Configuration Reference: ../network-config-ref
 .. _OSD Config Reference: ../osd-config-ref
 .. _Configuring Monitor/OSD Interaction: ../mon-osd-interaction

@@ -424,23 +424,30 @@ information stored in OSDs.::
     rm -rf $ms
     ssh user@host <<EOF
       for osd in /var/lib/osd/osd-*; do
-        ceph-objectstore-tool --data-path $osd --op update-mon-db --mon-store-path $ms
+        ceph-objectstore-tool --data-path \$osd --op update-mon-db --mon-store-path $ms
       done
     EOF
     rsync -avz user@host:$ms $ms
   done
   # rebuild the monitor store from the collected map, if the cluster does not
-  # use cephx authentication, there is no need to pass the "--keyring" option.
-  # i.e. use "ceph-monstore-tool /tmp/mon-store rebuild" instead
+  # use cephx authentication, we can skip the following steps to update the
+  # keyring with the caps, and there is no need to pass the "--keyring" option.
+  # i.e. just use "ceph-monstore-tool /tmp/mon-store rebuild" instead
+  ceph-authtool /path/to/admin.keyring -n mon. \
+    --cap mon allow 'allow *'
+  ceph-authtool /path/to/admin.keyring -n client.admin \
+    --cap mon allow 'allow *' --cap osd 'allow *' --cap mds 'allow *'
   ceph-monstore-tool /tmp/mon-store rebuild -- --keyring /path/to/admin.keyring
   # backup corrupted store.db just in case
   mv /var/lib/ceph/mon/mon.0/store.db /var/lib/ceph/mon/mon.0/store.db.corrupted
   mv /tmp/mon-store/store.db /var/lib/ceph/mon/mon.0/store.db
+  chown -R ceph:ceph /var/lib/ceph/mon/mon.0/store.db
 
 The steps above
 
 #. collect the map from all OSD hosts,
 #. then rebuild the store,
+#. fill the entities in keyring file with appropriate caps
 #. replace the corrupted store on ``mon.0`` with the recovered copy.
 
 Known limitations

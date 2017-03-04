@@ -50,7 +50,7 @@ public:
   }
 
 protected:
-  virtual void finish(int r) {
+  void finish(int r) override {
     (obj->*MF)(r);
   }
 };
@@ -63,7 +63,7 @@ public:
   }
 
 protected:
-  virtual void complete(int r) override {
+  void complete(int r) override {
     Context *on_finish = (obj->*MF)(&r);
     if (on_finish != nullptr) {
       on_finish->complete(r);
@@ -73,7 +73,7 @@ protected:
     }
     Context::complete(r);
   }
-  virtual void finish(int r) override {
+  void finish(int r) override {
   }
 };
 
@@ -85,7 +85,7 @@ struct C_AsyncCallback : public Context {
   C_AsyncCallback(WQ *op_work_queue, Context *on_finish)
     : op_work_queue(op_work_queue), on_finish(on_finish) {
   }
-  virtual void finish(int r) {
+  void finish(int r) override {
     op_work_queue->queue(on_finish, r);
   }
 };
@@ -156,6 +156,12 @@ Context *create_async_context_callback(I &image_ctx, Context *on_finish) {
       image_ctx.op_work_queue, on_finish);
 }
 
+template <typename WQ>
+Context *create_async_context_callback(WQ *work_queue, Context *on_finish) {
+  // use async callback to acquire a clean lock context
+  return new detail::C_AsyncCallback<WQ>(work_queue, on_finish);
+}
+
 // TODO: temporary until AioCompletion supports templated ImageCtx
 inline ImageCtx *get_image_ctx(ImageCtx *image_ctx) {
   return image_ctx;
@@ -197,7 +203,10 @@ private:
   Context *m_on_finish = nullptr;
 };
 
+uint64_t get_rbd_default_features(CephContext* cct);
+
 } // namespace util
+
 } // namespace librbd
 
 #endif // CEPH_LIBRBD_UTILS_H

@@ -175,6 +175,13 @@ To delete a pool, execute::
 
 	ceph osd pool delete {pool-name} [{pool-name} --yes-i-really-really-mean-it]
 
+
+To remove a pool the mon_allow_pool_delete flag must be set to true in the Monitor's
+configuration. Otherwise they will refuse to remove a pool.
+
+See `Monitor Configuration`_ for more information.
+
+.. _Monitor Configuration: ../../configuration/mon-config-ref
 	
 If you created your own rulesets and rules for a pool you created,  you should
 consider removing them when you no longer need your pool::
@@ -267,15 +274,6 @@ You may set values for the following keys:
 
 :Type: Integer
 :Version: ``0.54`` and above
-
-.. _crash_replay_interval:
-
-``crash_replay_interval``
-
-:Description: The number of seconds to allow clients to replay acknowledged, 
-              but uncommitted requests.
-              
-:Type: Integer
 
 .. _pg_num:
 
@@ -565,12 +563,6 @@ You may get values for the following keys:
 
 :Type: Integer
 :Version: ``0.54`` and above
-
-``crash_replay_interval``
-
-:Description: see crash_replay_interval_
-              
-:Type: Integer
 
 ``pg_num``
 

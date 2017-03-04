@@ -126,7 +126,7 @@ public:
   /**
    * Add a (created) bucket to the user's bucket list.
    */
-  void add(RGWBucketEnt& bucket) {
+  void add(const RGWBucketEnt& bucket) {
     buckets[bucket.bucket.name] = bucket;
   }
 
@@ -277,7 +277,8 @@ public:
           list<rgw_obj_key>& objs_to_unlink, std::string *err_msg = NULL);
 
   int check_object_index(RGWBucketAdminOpState& op_state,
-          map<string, RGWObjEnt> result, std::string *err_msg = NULL);
+                         RGWFormatterFlusher& flusher,
+                         std::string *err_msg = NULL);
 
   int check_index(RGWBucketAdminOpState& op_state,
           map<RGWObjCategory, RGWStorageStats>& existing_stats,

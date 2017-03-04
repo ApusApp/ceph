@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #ifndef CEPH_TEST_LIBRBD_TEST_MOCK_FIXTURE_H
@@ -64,8 +64,8 @@ public:
   static void SetUpTestCase();
   static void TearDownTestCase();
 
-  virtual void SetUp();
-  virtual void TearDown();
+  void SetUp() override;
+  void TearDown() override;
 
   ::testing::NiceMock<librados::MockTestMemRadosClient> &get_mock_rados_client() {
     return *s_mock_rados_client;

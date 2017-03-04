@@ -4,10 +4,12 @@
 #ifndef CEPH_LIBRBD_JOURNAL_TYPES_H
 #define CEPH_LIBRBD_JOURNAL_TYPES_H
 
+#include "cls/rbd/cls_rbd_types.h"
 #include "include/int_types.h"
 #include "include/buffer.h"
 #include "include/encoding.h"
 #include "include/types.h"
+#include "include/utime.h"
 #include <iosfwd>
 #include <list>
 #include <boost/none.hpp>
@@ -40,6 +42,7 @@ enum EventType {
   EVENT_TYPE_UPDATE_FEATURES = 15,
   EVENT_TYPE_METADATA_SET    = 16,
   EVENT_TYPE_METADATA_REMOVE = 17,
+  EVENT_TYPE_AIO_WRITESAME   = 18,
 };
 
 struct AioDiscardEvent {
@@ -47,11 +50,12 @@ struct AioDiscardEvent {
 
   uint64_t offset;
   uint64_t length;
+  bool skip_partial_discard;
 
-  AioDiscardEvent() : offset(0), length(0) {
+  AioDiscardEvent() : offset(0), length(0), skip_partial_discard(false) {
   }
-  AioDiscardEvent(uint64_t _offset, uint64_t _length)
-    : offset(_offset), length(_length) {
+  AioDiscardEvent(uint64_t _offset, uint64_t _length, bool _skip_partial_discard)
+    : offset(_offset), length(_length), skip_partial_discard(_skip_partial_discard) {
   }
 
   void encode(bufferlist& bl) const;
@@ -66,13 +70,30 @@ struct AioWriteEvent {
   uint64_t length;
   bufferlist data;
 
-  static uint32_t get_fixed_size() {
-    return 30; /// version encoding, type, offset, length
-  }
+  static uint32_t get_fixed_size();
 
   AioWriteEvent() : offset(0), length(0) {
   }
   AioWriteEvent(uint64_t _offset, uint64_t _length, const bufferlist &_data)
+    : offset(_offset), length(_length), data(_data) {
+  }
+
+  void encode(bufferlist& bl) const;
+  void decode(__u8 version, bufferlist::iterator& it);
+  void dump(Formatter *f) const;
+};
+
+struct AioWriteSameEvent {
+  static const EventType TYPE = EVENT_TYPE_AIO_WRITESAME;
+
+  uint64_t offset;
+  uint64_t length;
+  bufferlist data;
+
+  AioWriteSameEvent() : offset(0), length(0) {
+  }
+  AioWriteSameEvent(uint64_t _offset, uint64_t _length,
+                    const bufferlist &_data)
     : offset(_offset), length(_length), data(_data) {
   }
 
@@ -135,16 +156,17 @@ protected:
 
 struct SnapCreateEvent : public SnapEventBase {
   static const EventType TYPE = EVENT_TYPE_SNAP_CREATE;
+  cls::rbd::SnapshotNamespace snap_namespace;
 
   SnapCreateEvent() {
   }
-  SnapCreateEvent(uint64_t op_tid, const std::string &snap_name)
-    : SnapEventBase(op_tid, snap_name) {
+  SnapCreateEvent(uint64_t op_tid, const std::string &snap_name, const cls::rbd::SnapshotNamespace &_snap_namespace)
+    : SnapEventBase(op_tid, snap_name), snap_namespace(_snap_namespace) {
   }
 
-  using SnapEventBase::encode;
-  using SnapEventBase::decode;
-  using SnapEventBase::dump;
+  void encode(bufferlist& bl) const;
+  void decode(__u8 version, bufferlist::iterator& it);
+  void dump(Formatter *f) const;
 };
 
 struct SnapRemoveEvent : public SnapEventBase {
@@ -367,15 +389,22 @@ typedef boost::variant<AioDiscardEvent,
                        UpdateFeaturesEvent,
                        MetadataSetEvent,
                        MetadataRemoveEvent,
+                       AioWriteSameEvent,
                        UnknownEvent> Event;
 
 struct EventEntry {
+  static uint32_t get_fixed_size() {
+    return EVENT_FIXED_SIZE + METADATA_FIXED_SIZE;
+  }
+
   EventEntry() : event(UnknownEvent()) {
   }
-  EventEntry(const Event &_event) : event(_event) {
+  EventEntry(const Event &_event, const utime_t &_timestamp = utime_t())
+    : event(_event), timestamp(_timestamp) {
   }
 
   Event event;
+  utime_t timestamp;
 
   EventType get_event_type() const;
 
@@ -384,6 +413,13 @@ struct EventEntry {
   void dump(Formatter *f) const;
 
   static void generate_test_instances(std::list<EventEntry *> &o);
+
+private:
+  static const uint32_t EVENT_FIXED_SIZE = 14; /// version encoding, type
+  static const uint32_t METADATA_FIXED_SIZE = 14; /// version encoding, timestamp
+
+  void encode_metadata(bufferlist& bl) const;
+  void decode_metadata(bufferlist::iterator& it);
 };
 
 // Journal Client data structures

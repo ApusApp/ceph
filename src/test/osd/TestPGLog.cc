@@ -21,18 +21,16 @@
 
 #include <stdio.h>
 #include <signal.h>
+#include "gtest/gtest.h"
 #include "osd/PGLog.h"
 #include "osd/OSDMap.h"
-#include "common/ceph_argparse.h"
-#include "global/global_init.h"
-#include <gtest/gtest.h>
 
 class PGLogTest : public ::testing::Test, protected PGLog {
 public:
   PGLogTest() : PGLog(g_ceph_context) {}
-  virtual void SetUp() { }
+  void SetUp() override { }
 
-  virtual void TearDown() {
+  void TearDown() override {
     clear();
   }
 
@@ -50,7 +48,7 @@ public:
   static pg_log_entry_t mk_ple_mod(
     const hobject_t &hoid, eversion_t v, eversion_t pv) {
     pg_log_entry_t e;
-    e.mod_desc.mark_unrollbackable();
+    e.mark_unrollbackable();
     e.op = pg_log_entry_t::MODIFY;
     e.soid = hoid;
     e.version = v;
@@ -60,7 +58,7 @@ public:
   static pg_log_entry_t mk_ple_dt(
     const hobject_t &hoid, eversion_t v, eversion_t pv) {
     pg_log_entry_t e;
-    e.mod_desc.mark_unrollbackable();
+    e.mark_unrollbackable();
     e.op = pg_log_entry_t::DELETE;
     e.soid = hoid;
     e.version = v;
@@ -94,7 +92,7 @@ public:
     pg_missing_t init;
     pg_missing_t final;
 
-    set<hobject_t, hobject_t::BitwiseComparator> toremove;
+    set<hobject_t> toremove;
     list<pg_log_entry_t> torollback;
 
   private:
@@ -155,22 +153,24 @@ public:
   };
 
   struct LogHandler : public PGLog::LogEntryHandler {
-    set<hobject_t, hobject_t::BitwiseComparator> removed;
+    set<hobject_t> removed;
     list<pg_log_entry_t> rolledback;
     
     void rollback(
-      const pg_log_entry_t &entry) {
+      const pg_log_entry_t &entry) override {
       rolledback.push_back(entry);
     }
+    void rollforward(
+      const pg_log_entry_t &entry) override {}
     void remove(
-      const hobject_t &hoid) {
+      const hobject_t &hoid) override {
       removed.insert(hoid);
     }
     void try_stash(const hobject_t &, version_t) override {
       // lost/unfound cases are not tested yet
     }
     void trim(
-      const pg_log_entry_t &entry) {}
+      const pg_log_entry_t &entry) override {}
   };
 
   template <typename missing_t>
@@ -204,8 +204,8 @@ public:
     }
 
     {
-      set<hobject_t, hobject_t::BitwiseComparator>::const_iterator titer = tcase.toremove.begin();
-      set<hobject_t, hobject_t::BitwiseComparator>::const_iterator hiter = handler.removed.begin();
+      set<hobject_t>::const_iterator titer = tcase.toremove.begin();
+      set<hobject_t>::const_iterator hiter = handler.removed.begin();
       for (; titer != tcase.toremove.end(); ++titer, ++hiter) {
 	EXPECT_EQ(*titer, *hiter);
       }
@@ -260,7 +260,8 @@ public:
     for (list<pg_log_entry_t>::const_iterator i = tcase.auth.begin();
 	 i != tcase.auth.end();
 	 ++i) {
-      omissing.add_next_event(*i);
+      if (i->version > oinfo.last_update)
+	omissing.add_next_event(*i);
     }
     verify_missing(tcase, omissing);
   }
@@ -275,9 +276,11 @@ struct TestHandler : public PGLog::LogEntryHandler {
   explicit TestHandler(list<hobject_t> &removed) : removed(removed) {}
 
   void rollback(
-    const pg_log_entry_t &entry) {}
+    const pg_log_entry_t &entry) override {}
+  void rollforward(
+    const pg_log_entry_t &entry) override {}
   void remove(
-    const hobject_t &hoid) {
+    const hobject_t &hoid) override {
     removed.push_back(hoid);
   }
   void cant_rollback(const pg_log_entry_t &entry) {}
@@ -285,26 +288,10 @@ struct TestHandler : public PGLog::LogEntryHandler {
     // lost/unfound cases are not tested yet
   }
   void trim(
-    const pg_log_entry_t &entry) {}
+    const pg_log_entry_t &entry) override {}
 };
 
 TEST_F(PGLogTest, rewind_divergent_log) {
-  // newhead > log.tail : throw an assert
-  {
-    clear();
-
-    ObjectStore::Transaction t;
-    pg_info_t info;
-    list<hobject_t> remove_snap;
-    bool dirty_info = false;
-    bool dirty_big_info = false;
-
-    log.tail = eversion_t(2, 1);
-    TestHandler h(remove_snap);
-    EXPECT_DEATH(rewind_divergent_log(t, eversion_t(1, 1), info, &h,
-				      dirty_info, dirty_big_info), "");
-  }
-
   /*        +----------------+
             |  log           |
             +--------+-------+
@@ -341,7 +328,7 @@ TEST_F(PGLogTest, rewind_divergent_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.set_hash(0x5);
@@ -421,7 +408,7 @@ TEST_F(PGLogTest, rewind_divergent_log) {
     eversion_t newhead;
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       info.log_tail = log.tail = eversion_t(1, 1);
       newhead = eversion_t(1, 3);
@@ -470,20 +457,20 @@ TEST_F(PGLogTest, rewind_divergent_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
       e.version = eversion_t(1, 5);
       e.soid.set_hash(0x9);
       add(e);
     }
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
       e.version = eversion_t(1, 6);
       e.soid.set_hash(0x10);
       add(e);
     }
     TestHandler h(remove_snap);
-    trim_rollback_info(eversion_t(1, 6), &h);
+    roll_forward_to(eversion_t(1, 6), &h);
     rewind_divergent_log(t, eversion_t(1, 5), info, &h,
 			 dirty_info, dirty_big_info);
     pg_log_t log;
@@ -498,13 +485,14 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     info.last_backfill = hobject_t();
-    info.last_backfill.set_hash(1);
+    info.last_backfill.set_hash(100);
     oe.soid.set_hash(2);
+    ASSERT_GT(oe.soid, info.last_backfill);
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -533,7 +521,7 @@ TEST_F(PGLogTest, merge_old_entry) {
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
-    ne.mod_desc.mark_unrollbackable();
+    ne.mark_unrollbackable();
     ne.version = eversion_t(2,1);
     log.add(ne);
 
@@ -548,7 +536,7 @@ TEST_F(PGLogTest, merge_old_entry) {
     {
       log.log.front().op = pg_log_entry_t::DELETE;
       pg_log_entry_t oe;
-      oe.mod_desc.mark_unrollbackable();
+      oe.mark_unrollbackable();
       oe.version = eversion_t(1,1);
 
       TestHandler h(remove_snap);
@@ -561,7 +549,7 @@ TEST_F(PGLogTest, merge_old_entry) {
       ne.op = pg_log_entry_t::MODIFY;
       missing.add_next_event(ne);
       pg_log_entry_t oe;
-      oe.mod_desc.mark_unrollbackable();
+      oe.mark_unrollbackable();
       oe.version = eversion_t(1,1);
 
       TestHandler h(remove_snap);
@@ -588,12 +576,12 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
-    ne.mod_desc.mark_unrollbackable();
+    ne.mark_unrollbackable();
     ne.version = eversion_t(1,1);
     ne.op = pg_log_entry_t::DELETE;
     log.add(ne);
@@ -626,12 +614,12 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
-    ne.mod_desc.mark_unrollbackable();
+    ne.mark_unrollbackable();
     ne.version = eversion_t(1,1);
     ne.op = pg_log_entry_t::DELETE;
     log.add(ne);
@@ -667,7 +655,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -705,7 +693,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -742,7 +730,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -780,7 +768,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
-    oe.mod_desc.mark_unrollbackable();
+    oe.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -963,7 +951,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 4);
       e.soid.set_hash(0x5);
@@ -1060,7 +1048,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.set_hash(0x5);
@@ -1173,7 +1161,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.set_hash(0x5);
@@ -1252,69 +1240,6 @@ TEST_F(PGLogTest, merge_log) {
 			   dirty_info, dirty_big_info), "");
   }
 
-  /*        +--------------------------+
-            |  log              olog   |
-            +--------+-------+---------+
-            |        |object |         |
-            |version | hash  | version |
-       tail > (0,0)  |       |         |
-            | (1,1)  |  x5   |         |
-            |        |       |         |
-            |        |       |         |
-       head > (1,2)  |  x3   |         |
-            |        |       |         |
-            |        |       |  (2,3)  < tail
-            |        |  x9   |  (2,4)  |
-            |        |       |         |
-            |        |  x5   |  (2,5)  < head
-            |        |       |         |
-            +--------+-------+---------+
-
-      If the logs do not overlap, throw an exception.
-
-  */
-  {
-    clear();
-
-    ObjectStore::Transaction t;
-    pg_log_t olog;
-    pg_info_t oinfo;
-    pg_shard_t fromosd;
-    pg_info_t info;
-    list<hobject_t> remove_snap;
-    bool dirty_info = false;
-    bool dirty_big_info = false;
-
-    {
-      pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
-
-      log.tail = eversion_t();
-      e.version = eversion_t(1, 1);
-      e.soid.set_hash(0x5);
-      log.log.push_back(e);
-      e.version = eversion_t(1, 2);
-      e.soid.set_hash(0x3);
-      log.log.push_back(e);
-      log.head = e.version;
-      log.index();
-
-      info.last_update = log.head;
-
-      olog.tail = eversion_t(2, 3);
-      e.version = eversion_t(2, 4);
-      e.soid.set_hash(0x9);
-      olog.log.push_back(e);
-      e.version = eversion_t(2, 5);
-      e.soid.set_hash(0x5);
-      olog.log.push_back(e);
-      olog.head = e.version;
-    }
-
-    TestHandler h(remove_snap);
-    EXPECT_DEATH(merge_log(t, oinfo, olog, fromosd, info, &h,
-			   dirty_info, dirty_big_info), "");
-  }
 }
 
 TEST_F(PGLogTest, proc_replica_log) {
@@ -1382,7 +1307,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 2);
       e.soid.set_hash(0x5);
@@ -1433,7 +1358,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       {
 	e.soid = divergent_object;
@@ -1567,7 +1492,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid = divergent_object;
@@ -1655,7 +1580,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid = divergent_object;
@@ -1750,7 +1675,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.set_hash(0x9);
@@ -1940,8 +1865,36 @@ TEST_F(PGLogTest, merge_log_split_missing_entries_at_head) {
 
   t.setup();
   t.set_div_bounds(mk_evt(9, 79), mk_evt(8, 69));
-  t.set_auth_bounds(mk_evt(10, 160), mk_evt(9, 77));
+  t.set_auth_bounds(mk_evt(15, 160), mk_evt(9, 77));
   t.final.add(mk_obj(1), mk_evt(15, 150), mk_evt(8, 70));
+  run_test_case(t);
+}
+
+TEST_F(PGLogTest, olog_tail_gt_log_tail_split) {
+  TestCase t;
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(10, 100), mk_evt(8, 70)));
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(15, 150), mk_evt(10, 100)));
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(15, 155), mk_evt(15, 150)));
+
+  t.setup();
+  t.set_div_bounds(mk_evt(15, 153), mk_evt(15, 151));
+  t.set_auth_bounds(mk_evt(15, 156), mk_evt(10, 99));
+  t.final.add(mk_obj(1), mk_evt(15, 155), mk_evt(15, 150));
+  run_test_case(t);
+}
+
+TEST_F(PGLogTest, olog_tail_gt_log_tail_split2) {
+  TestCase t;
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(10, 100), mk_evt(8, 70)));
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(15, 150), mk_evt(10, 100)));
+  t.auth.push_back(mk_ple_mod(mk_obj(1), mk_evt(16, 155), mk_evt(15, 150)));
+  t.div.push_back(mk_ple_mod(mk_obj(1), mk_evt(15, 153), mk_evt(15, 150)));
+
+  t.setup();
+  t.set_div_bounds(mk_evt(15, 153), mk_evt(15, 151));
+  t.set_auth_bounds(mk_evt(16, 156), mk_evt(10, 99));
+  t.final.add(mk_obj(1), mk_evt(16, 155), mk_evt(0, 0));
+  t.toremove.insert(mk_obj(1));
   run_test_case(t);
 }
 
@@ -1968,19 +1921,9 @@ TEST_F(PGLogTest, filter_log_1) {
 
     const string hit_set_namespace("internal");
 
-    ObjectStore::Transaction t;
-    pg_info_t info;
-    list<hobject_t> remove_snap;
-    //bool dirty_info = false;
-    //bool dirty_big_info = false;
-
-    hobject_t divergent_object;
-    eversion_t divergent_version;
-    eversion_t prior_version;
-    eversion_t newhead;
     {
       pg_log_entry_t e;
-      e.mod_desc.mark_unrollbackable();
+      e.mark_unrollbackable();
       e.op = pg_log_entry_t::MODIFY;
       e.soid.pool = pool_id;
 
@@ -2020,12 +1963,22 @@ TEST_F(PGLogTest, filter_log_1) {
     ASSERT_EQ(total, num_objects);
 
     // Some should be removed
-    log.filter_log(pgid, *osdmap, hit_set_namespace);
+    {
+      pg_log_t filtered, reject;
+      pg_log_t::filter_log(
+	pgid, *osdmap, hit_set_namespace, log, filtered, reject);
+      log = IndexedLog(filtered);
+    }
     EXPECT_LE(log.log.size(), (size_t)total);
 
     // If we filter a second time, there should be the same total
     total = log.log.size();
-    log.filter_log(pgid, *osdmap, hit_set_namespace);
+    {
+      pg_log_t filtered, reject;
+      pg_log_t::filter_log(
+	pgid, *osdmap, hit_set_namespace, log, filtered, reject);
+      log = IndexedLog(filtered);
+    }
     EXPECT_EQ(log.log.size(), (size_t)total);
 
     // Increase pg_num as if there would be a split
@@ -2042,7 +1995,12 @@ TEST_F(PGLogTest, filter_log_1) {
     ASSERT_EQ(ret, 0);
 
     // We should have fewer entries after a filter
-    log.filter_log(pgid, *osdmap, hit_set_namespace);
+    {
+      pg_log_t filtered, reject;
+      pg_log_t::filter_log(
+	pgid, *osdmap, hit_set_namespace, log, filtered, reject);
+      log = IndexedLog(filtered);
+    }
     EXPECT_LE(log.log.size(), (size_t)total);
 
     // Make sure all internal entries are retained
@@ -2147,17 +2105,6 @@ TEST_F(PGLogTest, ErrorNotIndexedByObject) {
   EXPECT_EQ(del.prior_version, entry->prior_version);
   EXPECT_EQ(del.user_version, entry->user_version);
   EXPECT_EQ(del.reqid, entry->reqid);
-}
-
-int main(int argc, char **argv) {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
-
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
-  common_init_finish(g_ceph_context);
-
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
 }
 
 // Local Variables:

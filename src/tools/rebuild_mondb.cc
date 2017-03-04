@@ -187,7 +187,7 @@ int update_monitor(const OSDSuperblock& sb, MonitorDBStore& ms)
   case 0:
     return 0;
   default:
-    assert(0);
+    ceph_abort();
   }
   string uuid = stringify(sb.cluster_fsid) + "\n";
   bufferlist bl;
@@ -328,52 +328,6 @@ int update_osdmap(ObjectStore& fs, OSDSuperblock& sb, MonitorDBStore& ms)
        << osd_name << ": "
        << ntrimmed << " osdmaps trimmed, "
        << nadded << " osdmaps added." << std::endl;
-  return 0;
-}
-
-// rebuild
-//  - pgmap_meta/version
-//  - pgmap_meta/last_osdmap_epoch
-//  - pgmap_meta/last_pg_scan
-//  - pgmap_meta/full_ratio
-//  - pgmap_meta/nearfull_ratio
-//  - pgmap_meta/stamp
-int update_pgmap_meta(MonitorDBStore& st)
-{
-  const string prefix("pgmap_meta");
-  auto t = make_shared<MonitorDBStore::Transaction>();
-  // stolen from PGMonitor::create_pending()
-  // the first pgmap_meta
-  t->put(prefix, "version", 1);
-  {
-    auto stamp = ceph_clock_now(g_ceph_context);
-    bufferlist bl;
-    ::encode(stamp, bl);
-    t->put(prefix, "stamp", bl);
-  }
-  {
-    auto last_osdmap_epoch = st.get("osdmap", "last_committed");
-    t->put(prefix, "last_osdmap_epoch", last_osdmap_epoch);
-  }
-  // be conservative, so PGMonitor will scan the all pools for pg changes
-  t->put(prefix, "last_pg_scan", 1);
-  {
-    auto full_ratio = g_ceph_context->_conf->mon_osd_full_ratio;
-    if (full_ratio > 1.0)
-      full_ratio /= 100.0;
-    bufferlist bl;
-    ::encode(full_ratio, bl);
-    t->put(prefix, "full_ratio", bl);
-  }
-  {
-    auto nearfull_ratio = g_ceph_context->_conf->mon_osd_nearfull_ratio;
-    if (nearfull_ratio > 1.0)
-      nearfull_ratio /= 100.0;
-    bufferlist bl;
-    ::encode(nearfull_ratio, bl);
-    t->put(prefix, "nearfull_ratio", bl);
-  }
-  st.apply_transaction(t);
   return 0;
 }
 

@@ -77,11 +77,11 @@ using namespace std;
 #include "messages/MOSDPGInfo.h"
 #include "messages/MOSDPGCreate.h"
 #include "messages/MOSDPGTrim.h"
-#include "messages/MOSDPGMissing.h"
 #include "messages/MOSDScrub.h"
 #include "messages/MOSDRepScrub.h"
 #include "messages/MOSDPGScan.h"
 #include "messages/MOSDPGBackfill.h"
+#include "messages/MOSDBackoff.h"
 
 #include "messages/MRemoveSnaps.h"
 
@@ -190,7 +190,12 @@ void Message::encode(uint64_t features, int crcflags)
 {
   // encode and copy out of *m
   if (empty_payload()) {
+    assert(middle.length() == 0);
     encode_payload(features);
+
+    if (byte_throttler) {
+      byte_throttler->take(payload.length() + middle.length());
+    }
 
     // if the encoder didn't specify past compatibility, we assume it
     // is incompatible.
@@ -455,6 +460,9 @@ Message *decode_message(CephContext *cct, int crcflags,
   case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
     m = new MOSDPGUpdateLogMissingReply();
     break;
+  case CEPH_MSG_OSD_BACKOFF:
+    m = new MOSDBackoff;
+    break;
 
   case CEPH_MSG_OSD_MAP:
     m = new MOSDMap;
@@ -491,9 +499,6 @@ Message *decode_message(CephContext *cct, int crcflags,
     break;
   case MSG_REMOVE_SNAPS:
     m = new MRemoveSnaps;
-    break;
-  case MSG_OSD_PG_MISSING:
-    m = new MOSDPGMissing;
     break;
   case MSG_OSD_REP_SCRUB:
     m = new MOSDRepScrub;
@@ -759,7 +764,7 @@ Message *decode_message(CephContext *cct, int crcflags,
     if (cct) {
       ldout(cct, 0) << "can't decode unknown message type " << type << " MSG_AUTH=" << CEPH_MSG_AUTH << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+	ceph_abort();
     }
     return 0;
   }
@@ -777,7 +782,7 @@ Message *decode_message(CephContext *cct, int crcflags,
 		    << " because compat_version " << header.compat_version
 		    << " > supported version " << m->get_header().version << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+	ceph_abort();
     }
     m->put();
     return 0;
@@ -801,7 +806,7 @@ Message *decode_message(CephContext *cct, int crcflags,
       m->get_payload().hexdump(*_dout);
       *_dout << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+	ceph_abort();
     }
     m->put();
     return 0;

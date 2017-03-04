@@ -11,6 +11,7 @@
 #include "common/ceph_json.h"
 #include "common/safe_io.h"
 #include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/replace.hpp>
 
 #include "rgw_rest.h"
 #include "rgw_rest_s3.h"
@@ -30,8 +31,10 @@
 
 #include "rgw_ldap.h"
 #include "rgw_token.h"
+#include "rgw_rest_role.h"
 #include "include/assert.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
 using namespace rgw;
@@ -148,11 +151,20 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   map<string, string>::iterator riter;
   bufferlist metadata_bl;
 
-  if (op_ret)
-    goto done;
-
   if (sent_header)
     goto send_data;
+
+  if (custom_http_ret) {
+    set_req_state_err(s, 0);
+    dump_errno(s, custom_http_ret);
+  } else {
+    set_req_state_err(s, (partial_content && !op_ret) ? STATUS_PARTIAL_CONTENT
+          	  : op_ret);
+    dump_errno(s);
+  }
+
+  if (op_ret)
+    goto done;
 
   if (range_str)
     dump_range(s, start, end, s->obj_size);
@@ -160,7 +172,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   if (s->system_request &&
       s->info.args.exists(RGW_SYS_PARAM_PREFIX "prepend-metadata")) {
 
-    STREAM_IO(s)->print("Rgwx-Object-Size: %lld\r\n", (long long)total_len);
+    dump_header(s, "Rgwx-Object-Size", (long long)total_len);
 
     if (rgwx_stat) {
       /*
@@ -180,8 +192,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     stringstream ss;
     jf.flush(ss);
     metadata_bl.append(ss.str());
-    STREAM_IO(s)->print("Rgwx-Embedded-Metadata-Len: %lld\r\n",
-			(long long)metadata_bl.length());
+    dump_header(s, "Rgwx-Embedded-Metadata-Len", metadata_bl.length());
     total_len += metadata_bl.length();
   }
 
@@ -193,7 +204,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     if (r < 0) {
       ldout(s->cct, 0) << "ERROR: failed to decode pg ver attr, ignoring" << dendl;
     }
-    STREAM_IO(s)->print("Rgwx-Obj-PG-Ver: %lld\r\n", (long long)pg_ver);
+    dump_header(s, "Rgwx-Obj-PG-Ver", pg_ver);
 
     uint32_t source_zone_short_id = 0;
     r = decode_attr_bl_single_value(attrs, RGW_ATTR_SOURCE_ZONE, &source_zone_short_id, (uint32_t)0);
@@ -201,7 +212,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
       ldout(s->cct, 0) << "ERROR: failed to decode pg ver attr, ignoring" << dendl;
     }
     if (source_zone_short_id != 0) {
-      STREAM_IO(s)->print("Rgwx-Source-Zone-Short-Id: %lld\r\n", (long long)source_zone_short_id);
+      dump_header(s, "Rgwx-Source-Zone-Short-Id", source_zone_short_id);
     }
   }
 
@@ -214,15 +225,11 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
        * legit to perform GET on them through S3 API. In such situation,
        * a client should receive the composited content with corresponding
        * etag value. */
-      dump_etag(s, lo_etag.c_str());
+      dump_etag(s, lo_etag);
     } else {
       auto iter = attrs.find(RGW_ATTR_ETAG);
       if (iter != attrs.end()) {
-        bufferlist& bl = iter->second;
-        if (bl.length()) {
-	  const char * etag = bl.c_str();
-	  dump_etag(s, etag);
-        }
+        dump_etag(s, iter->second);
       }
     }
 
@@ -256,25 +263,15 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 			 sizeof(RGW_ATTR_META_PREFIX)-1) == 0) {
         /* User custom metadata. */
         name += sizeof(RGW_ATTR_PREFIX) - 1;
-        STREAM_IO(s)->print("%s: %s\r\n", name, iter->second.c_str());
+        dump_header(s, name, iter->second);
       }
     }
   }
 
 done:
-  if (custom_http_ret) {
-    set_req_state_err(s, 0);
-    dump_errno(s, custom_http_ret);
-  } else {
-    set_req_state_err(s, (partial_content && !op_ret) ? STATUS_PARTIAL_CONTENT
-          	  : op_ret);
-    dump_errno(s);
-  }
-
   for (riter = response_attrs.begin(); riter != response_attrs.end();
        ++riter) {
-    STREAM_IO(s)->print("%s: %s\r\n", riter->first.c_str(),
-			riter->second.c_str());
+    dump_header(s, riter->first, riter->second);
   }
 
   if (op_ret == -ERR_NOT_MODIFIED) {
@@ -287,13 +284,13 @@ done:
   }
 
   if (metadata_bl.length()) {
-    STREAM_IO(s)->write(metadata_bl.c_str(), metadata_bl.length());
+    dump_body(s, metadata_bl);
   }
   sent_header = true;
 
 send_data:
   if (get_data && !op_ret) {
-    int r = STREAM_IO(s)->write(bl.c_str() + bl_ofs, bl_len);
+    int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);
     if (r < 0)
       return r;
   }
@@ -554,7 +551,7 @@ void RGWListBucket_ObjStore_S3::send_versioned_response()
       dump_time(s, "LastModified", &iter->mtime);
       if (!iter->is_delete_marker()) {
 	s->formatter->dump_format("ETag", "\"%s\"", iter->etag.c_str());
-	s->formatter->dump_int("Size", iter->size);
+	s->formatter->dump_int("Size", iter->accounted_size);
 	s->formatter->dump_string("StorageClass", "STANDARD");
       }
       dump_owner(s, iter->owner, iter->owner_display_name);
@@ -628,7 +625,7 @@ void RGWListBucket_ObjStore_S3::send_response()
       }
       dump_time(s, "LastModified", &iter->mtime);
       s->formatter->dump_format("ETag", "\"%s\"", iter->etag.c_str());
-      s->formatter->dump_int("Size", iter->size);
+      s->formatter->dump_int("Size", iter->accounted_size);
       s->formatter->dump_string("StorageClass", "STANDARD");
       dump_owner(s, iter->owner, iter->owner_display_name);
       if (s->system_request) {
@@ -701,7 +698,7 @@ void RGWGetBucketVersioning_ObjStore_S3::send_response()
 
 class RGWSetBucketVersioningParser : public RGWXMLParser
 {
-  XMLObj *alloc_obj(const char *el) {
+  XMLObj *alloc_obj(const char *el) override {
     return new XMLObj;
   }
 
@@ -868,11 +865,8 @@ void RGWGetBucketWebsite_ObjStore_S3::send_response()
 
 static void dump_bucket_metadata(struct req_state *s, RGWBucketEnt& bucket)
 {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%lld", (long long)bucket.count);
-  STREAM_IO(s)->print("X-RGW-Object-Count: %s\r\n", buf);
-  snprintf(buf, sizeof(buf), "%lld", (long long)bucket.size);
-  STREAM_IO(s)->print("X-RGW-Bytes-Used: %s\r\n", buf);
+  dump_header(s, "X-RGW-Object-Count", static_cast<long long>(bucket.count));
+  dump_header(s, "X-RGW-Bytes-Used", static_cast<long long>(bucket.size));
 }
 
 void RGWStatBucket_ObjStore_S3::send_response()
@@ -907,7 +901,7 @@ class RGWLocationConstraint : public XMLObj
 public:
   RGWLocationConstraint() {}
   ~RGWLocationConstraint() {}
-  bool xml_end(const char *el) {
+  bool xml_end(const char *el) override {
     if (!el)
       return false;
 
@@ -928,7 +922,7 @@ public:
 
 class RGWCreateBucketParser : public RGWXMLParser
 {
-  XMLObj *alloc_obj(const char *el) {
+  XMLObj *alloc_obj(const char *el) override {
     return new XMLObj;
   }
 
@@ -1325,6 +1319,7 @@ void RGWPutObj_ObjStore_S3::send_response()
 {
   if (op_ret) {
     set_req_state_err(s, op_ret);
+    dump_errno(s);
   } else {
     if (s->cct->_conf->rgw_s3_success_create_obj_status) {
       op_ret = get_success_retcode(
@@ -1332,7 +1327,8 @@ void RGWPutObj_ObjStore_S3::send_response()
       set_req_state_err(s, op_ret);
     }
     if (!copy_source) {
-      dump_etag(s, etag.c_str());
+      dump_errno(s);
+      dump_etag(s, etag);
       dump_content_length(s, 0);
     } else {
       dump_errno(s);
@@ -1357,7 +1353,6 @@ void RGWPutObj_ObjStore_S3::send_response()
   if (s->system_request && !real_clock::is_zero(mtime)) {
     dump_epoch_header(s, "Rgwx-Mtime", mtime);
   }
-  dump_errno(s);
   end_header(s, this);
 }
 
@@ -1367,8 +1362,8 @@ void RGWPutObj_ObjStore_S3::send_response()
 static void parse_params(const string& params_str, string& first,
 			 map<string, string>& params)
 {
-  int pos = params_str.find(';');
-  if (pos < 0) {
+  size_t pos = params_str.find(';');
+  if (pos == string::npos) {
     first = rgw_trim_whitespace(params_str);
     return;
   }
@@ -1377,18 +1372,17 @@ static void parse_params(const string& params_str, string& first,
 
   pos++;
 
-  while (pos < (int)params_str.size()) {
-    ssize_t end = params_str.find(';', pos);
-    if (end < 0)
+  while (pos < params_str.size()) {
+    size_t end = params_str.find(';', pos);
+    if (end == string::npos)
       end = params_str.size();
 
     string param = params_str.substr(pos, end - pos);
 
-    int eqpos = param.find('=');
-    if (eqpos > 0) {
-      string param_name = rgw_trim_whitespace(param.substr(0, eqpos));
-      string val = rgw_trim_quotes(param.substr(eqpos + 1));
-      params[param_name] = val;
+    size_t eqpos = param.find('=');
+    if (eqpos != string::npos) {
+      params[rgw_trim_whitespace(param.substr(0, eqpos))] =
+        rgw_trim_quotes(param.substr(eqpos + 1));
     } else {
       params[rgw_trim_whitespace(param)] = "";
     }
@@ -1400,12 +1394,12 @@ static void parse_params(const string& params_str, string& first,
 static int parse_part_field(const string& line, string& field_name,
 			    struct post_part_field& field)
 {
-  int pos = line.find(':');
-  if (pos < 0)
+  size_t pos = line.find(':');
+  if (pos == string::npos)
     return -EINVAL;
 
   field_name = line.substr(0, pos);
-  if (pos >= (int)line.size() - 1)
+  if (pos >= line.size() - 1)
     return 0;
 
   parse_params(line.substr(pos + 1), field.val, field.params);
@@ -1481,9 +1475,7 @@ int RGWPostObj_ObjStore_S3::read_with_boundary(bufferlist& bl, uint64_t max,
 
     bufferptr bp(need_to_read);
 
-    int read_len;
-    STREAM_IO(s)->read(bp.c_str(), need_to_read, &read_len);
-
+    const auto read_len = recv_body(s, bp.c_str(), need_to_read);
     in_data.append(bp, 0, read_len);
   }
 
@@ -1510,8 +1502,7 @@ int RGWPostObj_ObjStore_S3::read_with_boundary(bufferlist& bl, uint64_t max,
     if (left < skip + 2) {
       int need = skip + 2 - left;
       bufferptr boundary_bp(need);
-      int actual;
-      STREAM_IO(s)->read(boundary_bp.c_str(), need, &actual);
+      recv_body(s, boundary_bp.c_str(), need);
       in_data.append(boundary_bp);
     }
     max += skip; // skip boundary for next time
@@ -2174,10 +2165,10 @@ void RGWDeleteObj_ObjStore_S3::send_response()
   set_req_state_err(s, r);
   dump_errno(s);
   if (!version_id.empty()) {
-    dump_string_header(s, "x-amz-version-id", version_id.c_str());
+    dump_header(s, "x-amz-version-id", version_id);
   }
   if (delete_marker) {
-    dump_string_header(s, "x-amz-delete-marker", "true");
+    dump_header(s, "x-amz-delete-marker", "true");
   }
   end_header(s, this);
 }
@@ -2284,8 +2275,9 @@ void RGWCopyObj_ObjStore_S3::send_response()
 
   if (op_ret == 0) {
     dump_time(s, "LastModified", &mtime);
-    if (!etag.empty()) {
-      s->formatter->dump_string("ETag", etag);
+    std::string etag_str = etag.to_str();
+    if (! etag_str.empty()) {
+      s->formatter->dump_string("ETag", std::move(etag_str));
     }
     s->formatter->close_section();
     rgw_flush_formatter_and_reset(s, s->formatter);
@@ -2300,7 +2292,7 @@ void RGWGetACLs_ObjStore_S3::send_response()
   end_header(s, this, "application/xml");
   dump_start(s);
   rgw_flush_formatter(s, s->formatter);
-  STREAM_IO(s)->write(acls.c_str(), acls.size());
+  dump_body(s, acls);
 }
 
 int RGWPutACLs_ObjStore_S3::get_params()
@@ -2424,7 +2416,7 @@ void RGWGetCORS_ObjStore_S3::send_response()
 
     s3cors->to_xml(ss);
     cors = ss.str();
-    STREAM_IO(s)->write(cors.c_str(), cors.size());
+    dump_body(s, cors);
   }
 }
 
@@ -2445,11 +2437,11 @@ int RGWPutCORS_ObjStore_S3::get_params()
        r = -ENOMEM;
        goto done_err;
     }
-    int read_len;
-    r = STREAM_IO(s)->read(data, cl, &read_len, s->aws4_auth_needs_complete);
-    len = read_len;
-    if (r < 0)
+    len = recv_body(s, data, cl);
+    if (len < 0) {
+      r = len;
       goto done_err;
+    }
     data[len] = '\0';
   } else {
     len = 0;
@@ -2553,7 +2545,7 @@ void RGWGetRequestPayment_ObjStore_S3::send_response()
 
 class RGWSetRequestPaymentParser : public RGWXMLParser
 {
-  XMLObj *alloc_obj(const char *el) {
+  XMLObj *alloc_obj(const char *el) override {
     return new XMLObj;
   }
 
@@ -2756,7 +2748,7 @@ void RGWListMultipart_ObjStore_S3::send_response()
 
       s->formatter->dump_unsigned("PartNumber", info.num);
       s->formatter->dump_format("ETag", "\"%s\"", info.etag.c_str());
-      s->formatter->dump_unsigned("Size", info.size);
+      s->formatter->dump_unsigned("Size", info.accounted_size);
       s->formatter->close_section();
     }
     s->formatter->close_section();
@@ -2920,6 +2912,32 @@ RGWOp *RGWHandler_REST_Service_S3::op_get()
 RGWOp *RGWHandler_REST_Service_S3::op_head()
 {
   return new RGWListBuckets_ObjStore_S3;
+}
+
+RGWOp *RGWHandler_REST_Service_S3::op_post()
+{
+  if (s->info.args.exists("Action")) {
+    string action = s->info.args.get("Action");
+    if (action.compare("CreateRole") == 0)
+      return new RGWCreateRole;
+    if (action.compare("DeleteRole") == 0)
+      return new RGWDeleteRole;
+    if (action.compare("GetRole") == 0)
+      return new RGWGetRole;
+    if (action.compare("UpdateAssumeRolePolicy") == 0)
+      return new RGWModifyRole;
+    if (action.compare("ListRoles") == 0)
+      return new RGWListRoles;
+    if (action.compare("PutRolePolicy") == 0)
+      return new RGWPutRolePolicy;
+    if (action.compare("GetRolePolicy") == 0)
+      return new RGWGetRolePolicy;
+    if (action.compare("ListRolePolicies") == 0)
+      return new RGWListRolePolicies;
+    if (action.compare("DeleteRolePolicy") == 0)
+      return new RGWDeleteRolePolicy;
+  }
+  return NULL;
 }
 
 RGWOp *RGWHandler_REST_Bucket_S3::get_obj_op(bool get_data)
@@ -3197,7 +3215,7 @@ int RGWHandler_REST_S3::postauth_init()
 }
 
 int RGWHandler_REST_S3::init(RGWRados *store, struct req_state *s,
-			    RGWClientIO *cio)
+                             rgw::io::BasicClient *cio)
 {
   int ret;
 
@@ -3369,7 +3387,14 @@ int RGW_Auth_S3::authorize(RGWRados *store, struct req_state *s)
       if (algorithm != "AWS4-HMAC-SHA256") {
         return -EPERM;
       }
-      return authorize_v4(store, s);
+      /* compute first aws4 signature (stick to the boto2 implementation) */
+      int err = authorize_v4(store, s);
+      if ((err==-ERR_SIGNATURE_NO_MATCH) && !store->ctx()->_conf->rgw_s3_auth_aws4_force_boto2_compat) {
+        /* compute second aws4 signature (no bugs supported) */
+        ldout(s->cct, 10) << "computing second aws4 signature..." << dendl;
+        return authorize_v4(store, s, false);
+      }
+      return err;
     }
 
     /* AWS2 */
@@ -3523,20 +3548,18 @@ static std::array<string, 3> aws4_presigned_required_keys = { "Credential", "Sig
 /*
  * handle v4 signatures (rados auth only)
  */
-int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
+int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s, bool force_boto2_compat /* = true */)
 {
   string::size_type pos;
   bool using_qs;
 
   uint64_t now_req = 0;
-  uint64_t now = ceph_clock_now(s->cct);
+  uint64_t now = ceph_clock_now();
 
   /* v4 requires rados auth */
   if (!store->ctx()->_conf->rgw_s3_auth_use_rados) {
     return -EPERM;
   }
-
-  string algorithm = "AWS4-HMAC-SHA256";
 
   try {
     s->aws4_auth = std::unique_ptr<rgw_aws4_auth>(new rgw_aws4_auth);
@@ -3705,6 +3728,8 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
 
   if (s->aws4_auth->canonical_uri.empty()) {
     s->aws4_auth->canonical_uri = "/";
+  } else {
+    boost::replace_all(s->aws4_auth->canonical_uri, "+", "%20");
   }
 
   /* craft canonical query string */
@@ -3798,11 +3823,13 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
       }
     }
     string token_value = string(t);
-    if (using_qs && (token == "host")) {
-      if (!port.empty() && port != "80" && port != "0") {
-        token_value = token_value + ":" + port;
-      } else if (!secure_port.empty() && secure_port != "443") {
-        token_value = token_value + ":" + secure_port;
+    if (force_boto2_compat && using_qs && (token == "host")) {
+      if (!secure_port.empty()) {
+	if (secure_port != "443")
+	  token_value = token_value + ":" + secure_port;
+      } else if (!port.empty()) {
+	if (port != "80")
+	  token_value = token_value + ":" + port;
       }
     }
     canonical_hdrs_map[token] = rgw_trim_whitespace(token_value);
@@ -4146,7 +4173,7 @@ int RGW_Auth_S3::authorize_v2(RGWRados *store, struct req_state *s)
 }
 
 int RGWHandler_Auth_S3::init(RGWRados *store, struct req_state *state,
-			     RGWClientIO *cio)
+                             rgw::io::BasicClient *cio)
 {
   int ret = RGWHandler_REST_S3::init_from_header(state, RGW_FORMAT_JSON,
 						     true);
@@ -4156,7 +4183,8 @@ int RGWHandler_Auth_S3::init(RGWRados *store, struct req_state *state,
   return RGWHandler_REST::init(store, state, cio);
 }
 
-RGWHandler_REST* RGWRESTMgr_S3::get_handler(struct req_state *s)
+RGWHandler_REST* RGWRESTMgr_S3::get_handler(struct req_state* const s,
+                                            const std::string& frontend_prefix)
 {
   bool is_s3website = enable_s3website && (s->prot_flags & RGW_REST_WEBSITE);
   int ret =

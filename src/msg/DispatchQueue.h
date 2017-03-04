@@ -27,7 +27,6 @@
 #include "common/PrioritizedQueue.h"
 
 class CephContext;
-class DispatchQueue;
 class Messenger;
 class Message;
 struct Connection;
@@ -196,7 +195,7 @@ class DispatchQueue {
     cond.Signal();
   }
 
-  bool can_fast_dispatch(Message *m) const;
+  bool can_fast_dispatch(const Message *m) const;
   void fast_dispatch(Message *m);
   void fast_preprocess(Message *m);
   void enqueue(Message *m, int priority, uint64_t id);

@@ -23,7 +23,12 @@
     bucket stats               returns bucket statistics
     bucket rm                  remove bucket
     bucket check               check bucket index
+    bucket reshard             reshard bucket
+    bi get                     retrieve bucket index object entries
+    bi put                     store bucket index object entries
+    bi list                    list raw bucket index entries
     object rm                  remove object
+    object stat                stat an object for its metadata
     object unlink              unlink object from bucket index
     objects expire             run expired objects cleanup
     period delete              delete a period
@@ -58,6 +63,11 @@
     zonegroup remove           remove a zone from a zonegroup
     zonegroup rename           rename a zone group
     zonegroup list             list all zone groups set on this cluster
+    zonegroup placement list   list zonegroup's placement targets
+    zonegroup placement add    add a placement target id to a zonegroup
+    zonegroup placement modify modify a placement target of a specific zonegroup
+    zonegroup placement rm     remove a placement target from a zonegroup
+    zonegroup placement default  set a zonegroup's default placement target
     zonegroup-map get          show zonegroup-map
     zonegroup-map set          set zonegroup-map (requires infile)
     zone create                create a new zone
@@ -67,6 +77,10 @@
     zone set                   set zone cluster params (requires infile)
     zone list                  list all zones set on this cluster
     zone rename                rename a zone
+    zone placement list        list zone's placement targets
+    zone placement add         add a zone placement target
+    zone placement modify      modify a zone placement target
+    zone placement rm          remove a zone placement target
     pool add                   add an existing pool for data placement
     pool rm                    remove an existing pool from data placement set
     pools list                 list placement active set
@@ -108,6 +122,15 @@
     orphans find               init and run search for leaked rados objects (use job-id, pool)
     orphans finish             clean up search for leaked rados objects
     orphans list-jobs          list the current job-ids for orphans search
+    role create                create a AWS role for use with STS
+    role delete                delete a role
+    role get                   get a role
+    role list                  list roles with specified path prefix
+    role modify                modify the assume role policy of an existing role
+    role-policy put            add/update permission policy to role
+    role-policy list           list policies attached to a role
+    role-policy get            get the specified inline policy document embedded with the given role
+    role-policy delete         delete policy attached to a role
   options:
      --tenant=<tenant>         tenant name
      --uid=<id>                user id
@@ -159,7 +182,17 @@
      --source-zone             specify the source zone (for data sync)
      --default                 set entity (realm, zonegroup, zone) as default
      --read-only               set zone as read-only (when adding to zonegroup)
+     --placement-id            placement id for zonegroup placement commands
+     --tags=<list>             list of tags for zonegroup placement add and modify commands
+     --tags-add=<list>         list of tags to add for zonegroup placement modify command
+     --tags-rm=<list>          list of tags to remove for zonegroup placement modify command
      --endpoints=<list>        zone endpoints
+     --index_pool=<pool>       placement target index pool
+     --data_pool=<pool>        placement target data pool
+     --data_extra_pool=<pool>  placement target data extra (non-ec) pool
+     --placement-index-type=<type>
+                               placement target index type (normal, indexless, or #id)
+     --compression=<type>      placement target compression type (plugin name or empty/none)
      --tier-type=<type>        zone tier type
      --tier-config=<k>=<v>[,...]
                                set zone tier config keys, values
@@ -218,6 +251,14 @@
   
   Orphans list-jobs options:
      --extra-info              provide extra info in job list
+  
+  Role options:
+     --role-name               name of the role to create
+     --path                    path to the role
+     --assume-role-policy-doc  the trust relationship policy document that grants an entity permission to assume the role
+     --policy-name             name of the policy document
+     --policy-doc              permission policy document
+     --path-prefix             path prefix for filtering roles
   
     --conf/-c FILE    read configuration from the given configuration file
     --id/-i ID        set ID portion of my name

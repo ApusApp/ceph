@@ -40,10 +40,8 @@ class SimpleLock;
 class ScatterLock;
 class LocalLock;
 
-class MDCache;
-typedef ceph::shared_ptr<MDRequestImpl> MDRequestRef;
-
 #include "SimpleLock.h"
+#include "Mutation.h"
 
 class Locker {
 private:
@@ -234,13 +232,14 @@ public:
   void mark_updated_Filelock(ScatterLock *lock);
 
   // -- file i/o --
- public:
+public:
   version_t issue_file_data_version(CInode *in);
   Capability* issue_new_caps(CInode *in, int mode, Session *session, SnapRealm *conrealm, bool is_replay);
   bool issue_caps(CInode *in, Capability *only_cap=0);
   void issue_caps_set(set<CInode*>& inset);
   void issue_truncate(CInode *in);
   void revoke_stale_caps(Session *session);
+  void revoke_stale_caps(Capability *cap);
   void resume_stale_caps(Session *session);
   void remove_stale_leases(Session *session);
 
@@ -266,8 +265,9 @@ private:
   friend class C_Locker_FileUpdate_finish;
   friend class C_Locker_RetryCapRelease;
   friend class C_Locker_Eval;
-  friend class LockerContext;
   friend class C_Locker_ScatterWB;
+  friend class LockerContext;
+  friend class LockerLogContext;
 
   
   // -- client leases --

@@ -131,8 +131,8 @@ public:
       standby_daemons(rhs.standby_daemons),
       standby_epochs(rhs.standby_epochs)
   {
-    for (auto &i : rhs.filesystems) {
-      auto fs = i.second;
+    for (const auto &i : rhs.filesystems) {
+      const auto &fs = i.second;
       filesystems[fs->fscid] = std::make_shared<Filesystem>(*fs);
     }
   }
@@ -148,8 +148,8 @@ public:
     standby_daemons = rhs.standby_daemons;
     standby_epochs = rhs.standby_epochs;
 
-    for (auto &i : rhs.filesystems) {
-      auto fs = i.second;
+    for (const auto &i : rhs.filesystems) {
+      const auto &fs = i.second;
       filesystems[fs->fscid] = std::make_shared<Filesystem>(*fs);
     }
 
@@ -171,6 +171,17 @@ public:
     return enable_multiple;
   }
 
+  void set_legacy_client_fscid(fs_cluster_id_t fscid)
+  {
+    assert(fscid == FS_CLUSTER_ID_NONE || filesystems.count(fscid));
+    legacy_client_fscid = fscid;
+  }
+
+  fs_cluster_id_t get_legacy_client_fscid() const
+  {
+    return legacy_client_fscid;
+  }
+
   /**
    * Get state of all daemons (for all filesystems, including all standbys)
    */
@@ -182,8 +193,8 @@ public:
     }
 
     for (const auto &i : filesystems) {
-      auto fs_info = i.second->mds_map.get_mds_info();
-      for (auto j : fs_info) {
+      const auto &fs_info = i.second->mds_map.get_mds_info();
+      for (const auto &j : fs_info) {
         result[j.first] = j.second;
       }
     }
@@ -293,6 +304,33 @@ public:
   bool undamaged(const fs_cluster_id_t fscid, const mds_rank_t rank);
 
   /**
+   * Initialize a Filesystem and assign a fscid.  Update legacy_client_fscid
+   * to point to the new filesystem if it's the only one.
+   *
+   * Caller must already have validated all arguments vs. the existing
+   * FSMap and OSDMap contents.
+   */
+  void create_filesystem(const std::string &name,
+                         int64_t metadata_pool, int64_t data_pool,
+                         uint64_t features);
+
+  /**
+   * Remove the filesystem (it must exist).  Caller should already
+   * have failed out any MDSs that were assigned to the filesystem.
+   */
+  void erase_filesystem(fs_cluster_id_t fscid)
+  {
+    filesystems.erase(fscid);
+  }
+
+  /**
+   * Reset all the state information (not configuration information)
+   * in a particular filesystem.  Caller must have verified that
+   * the filesystem already exists.
+   */
+  void reset_filesystem(fs_cluster_id_t fscid);
+
+  /**
    * Mutator helper for Filesystem objects: expose a non-const
    * Filesystem pointer to `fn` and update epochs appropriately.
    */
@@ -319,7 +357,7 @@ public:
       assert(info.state == MDSMap::STATE_STANDBY);
       standby_epochs[who] = epoch;
     } else {
-      auto fs = filesystems[mds_roles.at(who)];
+      const auto &fs = filesystems[mds_roles.at(who)];
       auto &info = fs->mds_map.mds_info.at(who);
       fn(&info);
 
@@ -353,7 +391,7 @@ public:
     // but this is a lot simpler because it doesn't require us to
     // track the compat versions for standby daemons.
     compat = c;
-    for (auto i : filesystems) {
+    for (const auto &i : filesystems) {
       MDSMap &mds_map = i.second->mds_map;
       mds_map.compat = c;
       mds_map.epoch = epoch;
@@ -389,7 +427,7 @@ public:
   std::shared_ptr<const Filesystem> get_filesystem(void) const {return std::const_pointer_cast<const Filesystem>(filesystems.begin()->second);}
   std::shared_ptr<const Filesystem> get_filesystem(const std::string &name) const
   {
-    for (auto &i : filesystems) {
+    for (const auto &i : filesystems) {
       if (i.second->mds_map.fs_name == name) {
         return std::const_pointer_cast<const Filesystem>(i.second);
       }
@@ -444,14 +482,14 @@ public:
   }
 
   void print(ostream& out) const;
-  void print_summary(Formatter *f, ostream *out);
+  void print_summary(Formatter *f, ostream *out) const;
 
   void dump(Formatter *f) const;
   static void generate_test_instances(list<FSMap*>& ls);
 };
 WRITE_CLASS_ENCODER_FEATURES(FSMap)
 
-inline ostream& operator<<(ostream& out, FSMap& m) {
+inline ostream& operator<<(ostream& out, const FSMap& m) {
   m.print_summary(NULL, &out);
   return out;
 }

@@ -164,14 +164,14 @@ public:
   // RBD consistency groups support functions
   int group_create(IoCtx& io_ctx, const char *group_name);
   int group_remove(IoCtx& io_ctx, const char *group_name);
-  int group_list(IoCtx& io_ctx, std::vector<std::string>& names);
+  int group_list(IoCtx& io_ctx, std::vector<std::string> *names);
 
   int group_image_add(IoCtx& io_ctx, const char *group_name,
 		      IoCtx& image_io_ctx, const char *image_name);
   int group_image_remove(IoCtx& io_ctx, const char *group_name,
 			 IoCtx& image_io_ctx, const char *image_name);
   int group_image_list(IoCtx& io_ctx, const char *group_name,
-		       std::vector<group_image_status_t>& images);
+		       std::vector<group_image_status_t> *images);
 
 private:
   /* We don't allow assignment or copying */
@@ -241,6 +241,9 @@ public:
   int is_exclusive_lock_owner(bool *is_owner);
   int lock_acquire(rbd_lock_mode_t lock_mode);
   int lock_release();
+  int lock_get_owners(rbd_lock_mode_t *lock_mode,
+                      std::list<std::string> *lock_owners);
+  int lock_break(rbd_lock_mode_t lock_mode, const std::string &lock_owner);
 
   /* object map feature */
   int rebuild_object_map(ProgressContext &prog_ctx);
@@ -293,6 +296,7 @@ public:
   int snap_rename(const char *srcname, const char *dstname);
   int snap_get_limit(uint64_t *limit);
   int snap_set_limit(uint64_t limit);
+  int snap_get_timestamp(uint64_t snap_id, struct timespec *timestamp);
 
   /* I/O */
   ssize_t read(uint64_t ofs, size_t len, ceph::bufferlist& bl);
@@ -335,11 +339,14 @@ public:
   /* @param op_flags see librados.h constants beginning with LIBRADOS_OP_FLAG */
   ssize_t write2(uint64_t ofs, size_t len, ceph::bufferlist& bl, int op_flags);
   int discard(uint64_t ofs, uint64_t len);
+  ssize_t writesame(uint64_t ofs, size_t len, ceph::bufferlist &bl, int op_flags);
 
   int aio_write(uint64_t off, size_t len, ceph::bufferlist& bl, RBD::AioCompletion *c);
   /* @param op_flags see librados.h constants beginning with LIBRADOS_OP_FLAG */
   int aio_write2(uint64_t off, size_t len, ceph::bufferlist& bl,
 		  RBD::AioCompletion *c, int op_flags);
+  int aio_writesame(uint64_t off, size_t len, ceph::bufferlist& bl,
+                    RBD::AioCompletion *c, int op_flags);
   /**
    * read async from image
    *
